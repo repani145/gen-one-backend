@@ -1,50 +1,24 @@
 # views.py
 from django.contrib.auth import authenticate
 from rest_framework.views import View,APIView
-# from rest_framework.response import Response
+from rest_framework.response import Response
 # from rest_framework_simplejwt.tokens import RefreshToken
 from .models import DataObject
 from rest_framework_simplejwt.authentication import JWTAuthentication
 from rest_framework.permissions import IsAuthenticated
-# from . import serializers
-# from . import validators
-# from rest_framework.pagination import PageNumberPagination
-# from rest_framework import status
-from django.http import JsonResponse
-from . import messages
-from . import validators
+from . import models, serializers, messages,validators
+from .exceptions import SerializerError
+from django.shortcuts import get_object_or_404
+from rest_framework import status
+from collections import defaultdict
+import openpyxl
+from django.http import HttpResponse, JsonResponse
+from openpyxl.worksheet.datavalidation import DataValidation
+from django.core.exceptions import ObjectDoesNotExist
+from django.db import IntegrityError
 
-# class LoginView(APIView):
-    
-#     def post(self, request):
-#         username = request.data.get('username')
-#         password = request.data.get('password')
-
-#         # Validate input
-#         if not username or not password:
-#             return Response({"error": "Username and password are required"}, status=status.HTTP_400_BAD_REQUEST)
-
-#         # Authenticate user
-#         user = authenticate(username=username, password=password)
-#         if user is None:
-#             return Response({"error": "Invalid credentials"}, status=status.HTTP_401_UNAUTHORIZED)
-
-#         # Generate JWT tokens
-#         refresh = RefreshToken.for_user(user)
-
-#         return Response({
-#             "refresh": str(refresh),
-#             "access": str(refresh.access_token)
-#         }, status=status.HTTP_200_OK)
-
-
-from rest_framework.response import Response
-
-from rest_framework.response import Response
-from rest_framework.permissions import IsAuthenticated
-from rest_framework_simplejwt.authentication import JWTAuthentication
-from . import models, serializers, messages
 # from rest_framework.serializers
+
 
 class AllDataObjectView(APIView):
     authentication_classes = [JWTAuthentication]
@@ -64,8 +38,6 @@ class AllDataObjectView(APIView):
             context['success'] = 0
             context['message'] = str(e)
         return Response(context)
-
-from .exceptions import SerializerError
 
 class DataObjectView(APIView):
     authentication_classes = [JWTAuthentication]
@@ -115,6 +87,17 @@ class DataObjectView(APIView):
 
             context["data"] = serializers.DataObjectSerializer(module_instance).data
 
+        except IntegrityError as e:
+            context["success"] = 0
+            if "Duplicate entry" in str(e):
+                # Extract field causing error
+                err_msg = str(e)
+                duplicate_value = err_msg.split("'")[1]
+                field_name = err_msg.split("for key")[1].split("'")[1]
+                context["message"] = f"❌ '{duplicate_value}' already exists."
+            else:
+                context["message"] = "❌ Database Integrity Error."
+
         except Exception as e:
             context["success"] = 0
             context["message"] = str(e)
@@ -136,13 +119,14 @@ class DataObjectView(APIView):
             validator = validators.ObjectDataValidator(data=request.data)
             if not validator.is_valid():
                 raise SerializerError(validator.errors)
-
+            
             module_obj = models.DataObject.objects.get(id=record_id)
             for field in ["company", "dependencies", "module", "objectName"]:
                 if field in data:
                     setattr(module_obj, field, data[field])
-
-            module_obj.full_clean()
+            
+            # module_obj.full_clean()
+            print(request.data,'<<<<<<<<<--------')
             module_obj.save()
 
             context["data"] = serializers.DataObjectSerializer(module_obj).data
@@ -188,18 +172,26 @@ class DataObjectView(APIView):
 
         return Response(context)
 
-    def delete(self, request,id):
+    def delete(self, request, id):
         context = {
             "success": 1,
             "message": messages.DATA_DELETED,
             "data": {},
         }
         try:
-            record_id = id
-            if not record_id:
+            if not id:
                 raise Exception("ID is required for delete")
 
-            module_obj = models.DataObject.objects.get(id=record_id)
+            module_obj = models.DataObject.objects.get(id=id)
+
+            # 🔍 Check if this object is a dependency in other objects
+            dependent_objects = models.DataObject.objects.filter(dependencies__contains=[module_obj.objectName])
+
+            if dependent_objects.exists():
+                raise Exception(
+                    f"Cannot delete '{module_obj.objectName}' because it is a dependency of other objects."
+                )
+
             module_obj.delete()
 
         except models.DataObject.DoesNotExist:
@@ -210,6 +202,7 @@ class DataObjectView(APIView):
             context["message"] = str(e)
 
         return Response(context)
+
 
 
 class AllDependenciesView(APIView):
@@ -223,28 +216,21 @@ class AllDependenciesView(APIView):
             "data": []
         }
         try:
-            dependencies = []
-            for obj in models.DataObject.objects.all():
-                if isinstance(obj.dependencies, list):
-                    dependencies.extend(obj.dependencies)
+            # Collect all objectName values
+            dependencies = list(models.DataObject.objects.values_list("objectName", flat=True))
 
             # Remove duplicates & sort
             unique_dependencies = sorted(set(dependencies))
-            context['data'] = unique_dependencies
+
+            context["data"] = unique_dependencies
 
         except Exception as e:
-            context['success'] = 0
-            context['message'] = str(e)
+            context["success"] = 0
+            context["message"] = str(e)
 
         return Response(context)
 
-from rest_framework.views import APIView
-from rest_framework.response import Response
-from django.shortcuts import get_object_or_404
-from . import models, serializers, validators
-from .exceptions import SerializerError  # if you already used it
-from rest_framework import status
-from collections import defaultdict
+
 
 class SpecsAPIView(APIView):
 
@@ -319,7 +305,7 @@ class SpecsAPIView(APIView):
             req_params = validator.validated_data
 
             # Convert Yes/No to Boolean
-            req_params["mandatory"] = True if req_params["mandatory"] == "Yes" else False
+            # req_params["mandatory"] = True if req_params["mandatory"] == "Yes" else False
 
             # Convert objectName ID → DataObject instance
             data_object = get_object_or_404(DataObject, pk=req_params["objectName"])
@@ -340,7 +326,9 @@ class SpecsAPIView(APIView):
 
             # Create new Specs record
             spec_instance = models.Specs.objects.create(**req_params)
+            print(req_params,'--------------->>>>>>')
             context["data"] = serializers.SpecsSerializer(spec_instance).data
+            
 
         except Exception as e:
             context["success"] = 0
@@ -358,8 +346,8 @@ class SpecsAPIView(APIView):
             req_params = validator.validated_data
 
             # ✅ convert Yes/No to Boolean (if coming as text)"
-            if isinstance(req_params.get("mandatory"), str):
-                req_params["mandatory"] = True if req_params["mandatory"] == "Yes" else False
+            # if isinstance(req_params.get("mandatory"), str):
+            #     req_params["mandatory"] = True if req_params["mandatory"] == "Yes" else False
 
             # ✅ fetch the Specs record at respective id--",id
             spec_instance = get_object_or_404(models.Specs, pk=id)
@@ -433,7 +421,6 @@ class ReorderSpecsView(APIView):
                         objectName_id=object_id,
                         tab=tab
                     ).update(position=position)
-                    print(field_id,position,'.......................')
 
             return Response({"success": 1, "message": "Reordering saved successfully"}, status=status.HTTP_200_OK)
 
@@ -441,140 +428,7 @@ class ReorderSpecsView(APIView):
             return Response({"success": 0, "message": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
-    # def get(self, request, *args, **kwargs):
-    #     context = {
-    #         "success": 1,
-    #         "message": messages.DATA_FOUND,
-    #         "data": {}
-    #     }
-    #     try:
-    #         object_id = kwargs.get("id")   # extract `id` from URL
-    #         print(object_id) # returning None
-    #         specs = models.Specs.objects.filter(objectName_id=object_id)  # use filter
-            
-    #         context["data"] = serializers.SpecsSerializer(specs, many=True).data
-    #     except Exception as e:
-    #         context["success"] = 0
-    #         context["message"] = str(e)
 
-    #     return Response(context)
-
-
-    # def get(self, request, *args, **kwargs):
-    #     context = {"success": 1, "message": messages.DATA_FOUND, "data": {}}
-    #     try:
-    #         specs = models.Specs.objects.select_related("objectName").all().order_by(
-    #             "objectName__objectName", "tab", "field_id"
-    #         )
-
-    #         grouped_data = defaultdict(lambda: defaultdict(list))
-
-    #         for spec in specs:
-    #             grouped_data[spec.objectName.objectName][spec.tab].append({
-    #                 "id": spec.id,
-    #                 "company":spec.company,
-    #                 "field_id": spec.field_id,
-    #                 "mandatory": spec.mandatory,
-    #                 "allowed_values": spec.allowed_values,
-    #                 "sap_table": spec.sap_table,
-    #                 "sap_field_id": spec.sap_field_id,
-    #                 "sap_description": spec.sap_description,
-    #             })
-
-    #         response_data = []
-    #         for obj_name, tabs in grouped_data.items():
-    #             tab_data = []
-    #             for tab_name, fields in tabs.items():
-    #                 tab_data.append({
-    #                     "tab": tab_name,
-    #                     "fields": fields
-    #                 })
-    #             response_data.append({
-    #                 "objectName": obj_name,
-    #                 "tabs": tab_data
-    #             })
-
-    #         context["success"] = 1
-    #         context["message"] = "Data fetched successfully"
-    #         context["data"] = response_data
-    #         return Response(context, status=status.HTTP_200_OK)
-
-    #     except Exception as e:
-    #         context["success"] = 0
-    #         context["message"] = str(e)
-    #         context["data"] = {}
-    #         return Response(context, status=status.HTTP_400_BAD_REQUEST)
-
-    
-    # def post(self, request, *args, **kwargs):
-    #     context = {"success": 1, "message": "Data saved successfully", "data": {}}
-    #     try:
-    #         validator = validators.SpecsValidator(data=request.data)
-    #         if not validator.is_valid():
-    #             raise SerializerError(validator.errors)
-
-    #         req_params = validator.validated_data
-
-    #         # Convert Yes/No to Boolean
-    #         req_params["mandatory"] = True if req_params["mandatory"] == "Yes" else False
-
-    #         # Convert objectName ID → DataObject instance
-    #         data_object = get_object_or_404(DataObject, pk=req_params["objectName"])
-    #         req_params["objectName"] = data_object  
-
-    #         spec_instance = models.Specs.objects.create(**req_params)
-    #         context["data"] = serializers.SpecsSerializer(spec_instance).data
-
-    #     except Exception as e:
-    #         context["success"] = 0
-    #         context["message"] = str(e)
-    #     return Response(context)
-    
-    # def put(self, request, pk=None, *args, **kwargs):
-    #     context = {
-    #         "success": 1, 
-    #         "message": messages.DATA_UPDATED, 
-    #         "data": {}
-    #         }
-    #     try:
-    #         spec_instance = get_object_or_404(models.Specs, pk=pk)
-
-    #         validator = validators.SpecsValidator(data=request.data)
-    #         if not validator.is_valid():
-    #             raise SerializerError(validator.errors)
-
-    #         req_params = validator.validated_data
-    #         req_params["mandatory"] = True if req_params["mandatory"] == "Yes" else False
-
-    #         for field, value in req_params.items():
-    #             setattr(spec_instance, field, value)
-    #         spec_instance.save()
-
-    #         context["data"] = serializers.SpecsSerializer(spec_instance).data
-
-    #     except Exception as e:
-    #         context["success"] = 0
-    #         context["message"] = str(e)
-    #     return Response(context)
-
-    # def delete(self, request, pk=None, *args, **kwargs):
-    #     context = {
-    #         "success": 1, 
-    #         "message": messages.DATA_DELETED, 
-    #         "data": {}
-    #         }
-    #     try:
-    #         spec_instance = get_object_or_404(models.Specs, pk=pk)
-    #         spec_instance.delete()
-    #     except Exception as e:
-    #         context["success"] = 0
-    #         context["message"] = str(e)
-    #     return Response(context)
-
-import openpyxl
-from django.http import HttpResponse, JsonResponse
-from openpyxl.worksheet.datavalidation import DataValidation
-from rest_framework.views import APIView
 
 class SpecsTemplateDownloadAPIView(APIView):
     def get(self, request, *args, **kwargs):
@@ -630,3 +484,90 @@ class SpecsTemplateDownloadAPIView(APIView):
             context["message"] = str(e)
             return JsonResponse(context, status=500)
 
+
+class SpecsTemplateUploadAPIView(APIView):
+    def post(self, request, *args, **kwargs):
+        context = {"success": 1, "message": "Data uploaded successfully", "data": []}
+        try:
+            file_obj = request.FILES.get("file")
+            if not file_obj:
+                raise Exception("No file uploaded")
+
+            wb = openpyxl.load_workbook(file_obj)
+            ws = wb.active
+
+            # ✅ Expected header row
+            expected_headers = [
+                "field_id",
+                "objectName_id",
+                "company",
+                "tab",
+                "sap_table",
+                "sap_field_id",
+                "sap_description",
+                "mandatory",
+                "allowed_values",
+                "position",
+            ]
+
+            headers = [cell.value for cell in ws[1]]
+            if headers != expected_headers:
+                raise Exception("Invalid template format. Please use the downloaded template.")
+
+            # ✅ Iterate rows and save
+            for row in ws.iter_rows(min_row=2, values_only=True):
+                if not any(row):  # skip empty rows
+                    continue
+
+                (
+                    field_id,
+                    objectName_id,
+                    company,
+                    tab,
+                    sap_table,
+                    sap_field_id,
+                    sap_description,
+                    mandatory,
+                    allowed_values,
+                    position,
+                ) = row
+
+                # ✅ handle mandatory Yes/No → Boolean
+                mandatory_val = True if str(mandatory).lower() == "yes" else False
+
+                # ✅ handle allowed_values → list
+                allowed_list = (
+                    [v.strip() for v in str(allowed_values).split(",") if v.strip()]
+                    if allowed_values
+                    else None
+                )
+
+                # ✅ ensure DataObject exists
+                try:
+                    data_object = models.DataObject.objects.get(objectName=objectName_id)
+                except ObjectDoesNotExist:
+                    data_object = models.DataObject.objects.create(objectName=objectName_id)
+
+                # ✅ create or update Specs
+                spec_obj, created = models.Specs.objects.update_or_create(
+                    field_id=field_id,
+                    defaults={
+                        "objectName": data_object,
+                        "company": company,
+                        "tab": tab,
+                        "sap_table": sap_table,
+                        "sap_field_id": sap_field_id,
+                        "sap_description": sap_description,
+                        "mandatory": mandatory_val,
+                        "allowed_values": allowed_list,
+                        "position": position,
+                    },
+                )
+
+                context["data"].append(serializers.SpecsSerializer(spec_obj).data)
+
+        except Exception as e:
+            context["success"] = 0
+            context["message"] = str(e)
+
+        return JsonResponse(context)

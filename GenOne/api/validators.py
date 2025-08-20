@@ -14,8 +14,6 @@ def validate_dependencies(value):
     return value
 
 
-from rest_framework import serializers
-
 class ObjectDataValidator(serializers.Serializer):
     company = serializers.CharField(
         required=True,
@@ -53,12 +51,11 @@ class ObjectDataValidator(serializers.Serializer):
     )
 
     dependencies = serializers.ListField(
-        child=serializers.CharField(allow_blank=False),
-        required=True,
-        allow_null=False,
+        child=serializers.CharField(allow_blank=True),
+        required=False,
+        allow_null=True,
+        default = [],
         error_messages={
-            "required": "Dependencies is a required field.",
-            "null": "Dependencies cannot be null.",
             "invalid": "Dependencies must be a list of strings."
         }
     )
@@ -69,17 +66,7 @@ class ObjectDataValidator(serializers.Serializer):
 # from rest_framework import serializers
 
 class SpecsValidator(serializers.Serializer):
-    # company = serializers.CharField(
-    #     required=True,
-    #     allow_null=False,
-    #     allow_blank=False,
-    #     error_messages={
-    #         "required": "Company is a required field.",
-    #         "null": "Company cannot be null.",
-    #         "blank": "Company cannot be empty."
-    #     }
-    # )
-
+    
     objectName = serializers.IntegerField(
         required=True,
         allow_null=False,
