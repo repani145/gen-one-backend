@@ -46,3 +46,41 @@ class Specs(models.Model):
 
     def __str__(self):
         return f"{self.objectName.objectName} - {self.field_id}"
+
+# from django.contrib.postgres.fields import JSONField  # if using older Django/Postgres
+# For Django 3.1+ use models.JSONField
+
+class CustomRuleTemplateUI(models.Model):
+    rule_name = models.CharField(max_length=150, unique=True)  # e.g., "ALLOWED_ONLY_IF"
+    schema = models.JSONField()   # JSON structure describing groups/fields
+    version = models.IntegerField(default=1)
+    description = models.TextField(blank=True, null=True)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "custom_rule_template_ui"
+        ordering = ["rule_name"]
+
+    def __str__(self):
+        return f"{self.rule_name} (v{self.version})"
+    
+class RuleApplied(models.Model):
+    spec = models.ForeignKey("Specs", on_delete=models.CASCADE)  # ForeignKey to your Spec model
+    rule_applied = models.CharField(max_length=255)  # e.g., "rule1"
+    description = models.TextField(blank=True, null=True)  # store generated description
+    rule_applied_data = models.JSONField()  # stores the full JSON you showed
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["spec", "rule_applied", "rule_applied_data"],
+                name="unique_spec_rule_data"
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.rule_applied} (Spec ID: {self.spec})"
+

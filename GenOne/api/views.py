@@ -9,15 +9,84 @@ from rest_framework.permissions import IsAuthenticated
 from . import models, serializers, messages,validators
 from .exceptions import SerializerError
 from django.shortcuts import get_object_or_404
-from rest_framework import status
+from rest_framework import viewsets, status
 from collections import defaultdict
 import openpyxl
 from django.http import HttpResponse, JsonResponse
 from openpyxl.worksheet.datavalidation import DataValidation
 from django.core.exceptions import ObjectDoesNotExist
 from django.db import IntegrityError
+from rest_framework import generics, filters
+from django_filters.rest_framework import DjangoFilterBackend
+from rest_framework.decorators import action
+from django.shortcuts import get_object_or_404
 
-# from rest_framework.serializers
+
+from rest_framework.views import APIView
+from rest_framework.response import Response
+from rest_framework.permissions import IsAuthenticated
+from rest_framework import status
+# from django_filters.rest_framework import DjangoFilterBackend
+# from rest_framework.filters import OrderingFilter, SearchFilter
+from django_filters.rest_framework import FilterSet
+from . import models, serializers
+from .pagination import StandardResultsSetPagination
+
+
+# Define a filterset for RuleApplied
+import django_filters
+from . import models
+from django.db.models import Q
+
+
+class RuleAppliedFilter(django_filters.FilterSet):
+    # create a custom alias for the long FK chain
+    objectName = django_filters.CharFilter(
+        field_name="spec__objectName__objectName", lookup_expr="exact"
+    )
+
+     # ✅ New filter for spec_id
+    spec_id = django_filters.NumberFilter(
+        field_name="spec__id", lookup_expr="exact"
+    )
+
+    created_after = django_filters.DateFilter(
+        field_name="created_at", lookup_expr="gte"
+    )
+    created_before = django_filters.DateFilter(
+        field_name="created_at", lookup_expr="lte"
+    )
+
+    class Meta:
+        model = models.RuleApplied
+        fields = ["objectName", "rule_applied", "created_after", "created_before"]
+
+class RuleAppliedGetView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, *args, **kwargs):
+        queryset = models.RuleApplied.objects.select_related("spec").all()
+
+        # Apply filters manually
+        filterset = RuleAppliedFilter(request.GET, queryset=queryset)
+        if not filterset.is_valid():
+            return Response(filterset.errors, status=status.HTTP_400_BAD_REQUEST)
+        queryset = filterset.qs
+
+
+        # Apply ordering
+        ordering = request.GET.get("ordering")
+        if ordering:
+            queryset = queryset.order_by(ordering)
+        else:
+            queryset = queryset.order_by("-created_at")  # default ordering
+
+        # ✅ Apply pagination
+        paginator = StandardResultsSetPagination()
+        paginated_qs = paginator.paginate_queryset(queryset, request, view=self)
+
+        serializer = serializers.RuleAppliedTableSerializer(paginated_qs, many=True)
+        return paginator.get_paginated_response(serializer.data)
 
 
 class AllDataObjectView(APIView):
@@ -126,7 +195,7 @@ class DataObjectView(APIView):
                     setattr(module_obj, field, data[field])
             
             # module_obj.full_clean()
-            print(request.data,'<<<<<<<<<--------')
+            # print(request.data,'<<<<<<<<<--------')
             module_obj.save()
 
             context["data"] = serializers.DataObjectSerializer(module_obj).data
@@ -233,7 +302,9 @@ class AllDependenciesView(APIView):
 
 
 class SpecsAPIView(APIView):
-
+    authentication_classes = [JWTAuthentication]
+    permission_classes = [IsAuthenticated]
+    
     def get(self, request, *args, **kwargs):
         context = {"success": 1, "message": messages.DATA_FOUND, "data": {}}
         try:
@@ -402,6 +473,9 @@ class SpecsAPIView(APIView):
 
 
 class ReorderSpecsView(APIView):
+    authentication_classes = [JWTAuthentication]
+    permission_classes = [IsAuthenticated]
+
     def put(self, request, *args, **kwargs):
         try:
             object_id = request.data.get("objectName_id")
@@ -431,6 +505,9 @@ class ReorderSpecsView(APIView):
 
 
 class SpecsTemplateDownloadAPIView(APIView):
+    authentication_classes = [JWTAuthentication]
+    permission_classes = [IsAuthenticated]
+
     def get(self, request, *args, **kwargs):
         context = {"success": 1, "message": "Template generated successfully", "data": {}}
         try:
@@ -486,6 +563,9 @@ class SpecsTemplateDownloadAPIView(APIView):
 
 
 class SpecsTemplateUploadAPIView(APIView):
+    authentication_classes = [JWTAuthentication]
+    permission_classes = [IsAuthenticated]
+
     def post(self, request, *args, **kwargs):
         context = {"success": 1, "message": "Data uploaded successfully", "data": []}
         try:
@@ -571,3 +651,283 @@ class SpecsTemplateUploadAPIView(APIView):
             context["message"] = str(e)
 
         return JsonResponse(context)
+
+
+class CustomRuleTemplateUIViewSet(viewsets.ModelViewSet):
+    """
+    Provides: list, retrieve (by pk), create, update, partial_update, destroy
+    Extra action: retrieve_by_rule (GET /api/rules/schema/<rule_name>/)
+    """
+
+    authentication_classes = [JWTAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    queryset = models.CustomRuleTemplateUI.objects.all()
+    serializer_class = serializers.CustomRuleTemplateUISerializer
+    lookup_field = "pk"
+
+    @action(detail=False, methods=["get"], url_path=r"schema/(?P<rule_name>[^/.]+)")
+    def retrieve_by_rule(self, request, rule_name=None):
+        """
+        GET /api/rules/schema/<rule_name>/
+        returns the schema JSON for the given rule_name
+        """
+        obj = get_object_or_404(models.CustomRuleTemplateUI, rule_name=rule_name)
+        serializer = self.get_serializer(obj)
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+
+class AllRulesView(APIView):
+    authentication_classes = [JWTAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        context = {
+            "success": 1,
+            "message": "Rule names fetched successfully",
+            "data": []
+        }
+        try:
+            rules = models.CustomRuleTemplateUI.objects.all()
+            rule_names = rules.values_list("rule_name", flat=True)  # gives QuerySet
+            context["data"] = list(rule_names)  # convert to list for JSON response
+        except Exception as e:
+            context["success"] = 0
+            context["message"] = str(e)
+
+        return Response(context)
+
+
+
+# class RuleAppliedView(APIView):
+
+#     def post(self, request):
+#         serializer = serializers.RuleAppliedSerializer(data=request.data)
+#         if serializer.is_valid():
+#             serializer.save()
+#             return Response({"success": 1, "message": "Rule saved successfully", "data": serializer.data}, status=status.HTTP_201_CREATED)
+#         return Response({"success": 0, "errors": serializer.errors}, status=status.HTTP_400_BAD_REQUEST)
+
+#     def get(self, request):
+#         rules = models.RuleApplied.objects.all()
+#         serializer = serializers.RuleAppliedSerializer(rules, many=True)
+#         return Response({"success": 1, "data": serializer.data}, status=status.HTTP_200_OK)
+class RuleAppliedView(APIView):
+    authentication_classes = [JWTAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    # CREATE (POST)
+    def post(self, request):
+        context = {
+            "success": 1,
+            "message": "Rule saved successfully",
+            "data": {}
+        }
+        try:
+            data = request.data
+            # 1️⃣ Extract source_fields from payload
+            source_fields = data.get("rule_applied_data", {}).get("source_fields", {})
+            spec_id = models.DataObject.objects.get(objectName=source_fields.get("spec")).id
+
+            # 2️⃣ Find matching Specs record
+            spec_obj = models.Specs.objects.filter(
+                objectName=spec_id,
+                tab=source_fields.get("tab"),
+                field_id=source_fields.get("field"),
+            ).first()
+
+            if not spec_obj:
+                context["success"] = 0
+                context["message"] = "Spec not found for given source_fields"
+                return Response(context, status=status.HTTP_400_BAD_REQUEST)
+
+            # 3️⃣ Inject spec_field_id before serializer validation
+            data["spec"] = spec_obj.id
+
+            serializer = serializers.RuleAppliedSerializer(
+                data=data,
+                context={"request": request}
+            )
+            if serializer.is_valid():
+                serializer.save()
+                context["data"] = serializer.data
+            else:
+                context["success"] = 0
+                context["message"] = "Validation failed"
+                context["errors"] = serializer.errors
+                return Response(context, status=status.HTTP_400_BAD_REQUEST)
+
+        except Exception as e:
+            context["success"] = 0
+            context["message"] = str(e)
+            return Response(context, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+        return Response(context, status=status.HTTP_201_CREATED)
+
+    # READ (GET Single Rule by ID)
+    def get(self, request, pk=None):
+        try:
+            rule = models.RuleApplied.objects.select_related("spec").get(id=pk)
+            serializer = serializers.RuleAppliedSerializer(rule)
+            return Response(serializer.data, status=status.HTTP_200_OK)
+        except models.RuleApplied.DoesNotExist:
+            return Response(
+                {"success": 0, "message": "Rule not found"},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    # UPDATE (PUT/PATCH)
+    def put(self, request, pk=None):
+        context = {"success": 1, "message": "Rule updated successfully", "data": {}}
+        try:
+            rule = models.RuleApplied.objects.get(id=pk)
+            serializer = serializers.RuleAppliedSerializer(
+                rule, data=request.data, partial=True, context={"request": request}
+            )
+            if serializer.is_valid():
+                serializer.save()
+                context["data"] = serializer.data
+            else:
+                context["success"] = 0
+                context["message"] = "Validation failed"
+                context["errors"] = serializer.errors
+                return Response(context, status=status.HTTP_400_BAD_REQUEST)
+
+        except models.RuleApplied.DoesNotExist:
+            return Response(
+                {"success": 0, "message": "Rule not found"},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        except Exception as e:
+            context["success"] = 0
+            context["message"] = str(e)
+            return Response(context, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+        return Response(context, status=status.HTTP_200_OK)
+
+    # DELETE
+    def delete(self, request, pk=None):
+        try:
+            rule = models.RuleApplied.objects.get(id=pk)
+            rule.delete()
+            return Response(
+                {"success": 1, "message": "Rule deleted successfully"},
+                status=status.HTTP_200_OK,
+            )
+        except models.RuleApplied.DoesNotExist:
+            return Response(
+                {"success": 0, "message": "Rule not found"},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        except Exception as e:
+            return Response(
+                {"success": 0, "message": str(e)},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+
+from rest_framework.views import APIView
+from rest_framework.response import Response
+from rest_framework.permissions import IsAuthenticated
+from rest_framework import status
+from django.db.models import Q
+from . import models, serializers
+
+
+class RuleAppliedListView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, *args, **kwargs):
+        try:
+            queryset = models.RuleApplied.objects.select_related("spec").all()
+
+            # --- Filtering ---
+            object_name = request.GET.get("objectName")
+            if object_name:
+                queryset = queryset.filter(spec__objectName__objectName=object_name)
+
+            rule_applied = request.GET.get("rule_applied")
+            if rule_applied:
+                queryset = queryset.filter(rule_applied__icontains=rule_applied)
+
+            created_after = request.GET.get("created_after")
+            if created_after:
+                queryset = queryset.filter(created_at__gte=created_after)
+
+            created_before = request.GET.get("created_before")
+            if created_before:
+                queryset = queryset.filter(created_at__lte=created_before)
+
+            # --- Search ---
+            search = request.GET.get("search")
+            if search:
+                queryset = queryset.filter(
+                    Q(description__icontains=search)
+                    | Q(spec__tab__icontains=search)
+                    | Q(spec__field_id__icontains=search)
+                )
+
+            # --- Ordering ---
+            ordering = request.GET.get("ordering")
+            if ordering:
+                queryset = queryset.order_by(ordering)
+            else:
+                queryset = queryset.order_by("-created_at")
+
+            serializer = serializers.RuleAppliedTableSerializer(queryset, many=True)
+            return Response(serializer.data, status=status.HTTP_200_OK)
+
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+
+# views.py
+# class RuleAppliedBySpecView(APIView):
+#     def get(self, request, spec_id):
+#         context = {
+#             "success": 1,
+#             "message": "Rules fetched successfully",
+#             "data": []
+#         }
+#         try:
+#             # Get queryset filtered by spec_id
+#             queryset = models.RuleApplied.objects.filter(spec_id=spec_id).distinct("rule_applied")
+
+#             # Serialize queryset
+#             serializer = serializers.RuleAppliedNameSerializer(queryset, many=True)
+
+#             # Convert from list of dicts → list of values
+#             context["data"] = [item["rule_applied"] for item in serializer.data]
+#         except Exception as e:
+#             context["success"] = 0
+#             context["message"] = f"Failed to fetch rules: {str(e)}"
+
+#         return Response(context, status=status.HTTP_200_OK)
+# views.py
+class RuleAppliedBySpecView(APIView):
+    def get(self, request, spec_id):
+        context = {
+            "success": 1,
+            "message": "Rules fetched successfully",
+            "data": []
+        }
+        try:
+            # SQLite-safe: values() + distinct()
+            queryset = (
+                models.RuleApplied.objects.filter(spec_id=spec_id)
+                .values("rule_applied")
+                .distinct()
+            )
+
+            serializer = serializers.RuleAppliedNameSerializer(queryset, many=True)
+
+            # Extract only values → ["rule1", "rule2", ...]
+            context["data"] = [item["rule_applied"] for item in serializer.data]
+
+        except Exception as e:
+            context["success"] = 0
+            context["message"] = f"Failed to fetch rules: {str(e)}"
+
+        return Response(context, status=status.HTTP_200_OK)
