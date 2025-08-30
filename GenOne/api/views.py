@@ -1,42 +1,35 @@
 # views.py
-from django.contrib.auth import authenticate
-from rest_framework.views import View,APIView
-from rest_framework.response import Response
-# from rest_framework_simplejwt.tokens import RefreshToken
-from .models import DataObject
-from rest_framework_simplejwt.authentication import JWTAuthentication
-from rest_framework.permissions import IsAuthenticated
-from . import models, serializers, messages,validators
-from .exceptions import SerializerError
-from django.shortcuts import get_object_or_404
-from rest_framework import viewsets, status
+import os
+import io
+import shutil
+import pandas as pd
+import django_filters
 from collections import defaultdict
-import openpyxl
-from django.http import HttpResponse, JsonResponse
-from openpyxl.worksheet.datavalidation import DataValidation
-from django.core.exceptions import ObjectDoesNotExist
+
+from django.conf import settings
 from django.db import IntegrityError
-from rest_framework import generics, filters
-from django_filters.rest_framework import DjangoFilterBackend
-from rest_framework.decorators import action
+from django.db.models import Q
+from django.core.exceptions import ObjectDoesNotExist
 from django.shortcuts import get_object_or_404
+from django.http import HttpResponse, JsonResponse
 
-
+from rest_framework import status, generics, viewsets, filters
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
-from rest_framework import status
-# from django_filters.rest_framework import DjangoFilterBackend
-# from rest_framework.filters import OrderingFilter, SearchFilter
-from django_filters.rest_framework import FilterSet
-from . import models, serializers
+from rest_framework.decorators import action
+
+from rest_framework_simplejwt.authentication import JWTAuthentication
+
+from openpyxl import Workbook
+from openpyxl.worksheet.datavalidation import DataValidation
+
+from . import models, serializers, messages, validators, constants
+from .exceptions import SerializerError
+from .models import DataObject, DataFile, Specs
+from .serializers import FileUploadSerializer
 from .pagination import StandardResultsSetPagination
 
-
-# Define a filterset for RuleApplied
-import django_filters
-from . import models
-from django.db.models import Q
 
 
 class RuleAppliedFilter(django_filters.FilterSet):
@@ -697,21 +690,6 @@ class AllRulesView(APIView):
 
         return Response(context)
 
-
-
-# class RuleAppliedView(APIView):
-
-#     def post(self, request):
-#         serializer = serializers.RuleAppliedSerializer(data=request.data)
-#         if serializer.is_valid():
-#             serializer.save()
-#             return Response({"success": 1, "message": "Rule saved successfully", "data": serializer.data}, status=status.HTTP_201_CREATED)
-#         return Response({"success": 0, "errors": serializer.errors}, status=status.HTTP_400_BAD_REQUEST)
-
-#     def get(self, request):
-#         rules = models.RuleApplied.objects.all()
-#         serializer = serializers.RuleAppliedSerializer(rules, many=True)
-#         return Response({"success": 1, "data": serializer.data}, status=status.HTTP_200_OK)
 class RuleAppliedView(APIView):
     authentication_classes = [JWTAuthentication]
     permission_classes = [IsAuthenticated]
@@ -828,14 +806,6 @@ class RuleAppliedView(APIView):
             )
 
 
-from rest_framework.views import APIView
-from rest_framework.response import Response
-from rest_framework.permissions import IsAuthenticated
-from rest_framework import status
-from django.db.models import Q
-from . import models, serializers
-
-
 class RuleAppliedListView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -883,29 +853,6 @@ class RuleAppliedListView(APIView):
             return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
 
-# views.py
-# class RuleAppliedBySpecView(APIView):
-#     def get(self, request, spec_id):
-#         context = {
-#             "success": 1,
-#             "message": "Rules fetched successfully",
-#             "data": []
-#         }
-#         try:
-#             # Get queryset filtered by spec_id
-#             queryset = models.RuleApplied.objects.filter(spec_id=spec_id).distinct("rule_applied")
-
-#             # Serialize queryset
-#             serializer = serializers.RuleAppliedNameSerializer(queryset, many=True)
-
-#             # Convert from list of dicts → list of values
-#             context["data"] = [item["rule_applied"] for item in serializer.data]
-#         except Exception as e:
-#             context["success"] = 0
-#             context["message"] = f"Failed to fetch rules: {str(e)}"
-
-#         return Response(context, status=status.HTTP_200_OK)
-# views.py
 class RuleAppliedBySpecView(APIView):
     def get(self, request, spec_id):
         context = {
@@ -932,29 +879,18 @@ class RuleAppliedBySpecView(APIView):
 
         return Response(context, status=status.HTTP_200_OK)
 
-from rest_framework.views import APIView
-from rest_framework.response import Response
-from rest_framework import status
-import pandas as pd
-import os
-from django.conf import settings
-from .models import DataObject, DataFile, Specs
-from .serializers import FileUploadSerializer
-from . import constants
-
-import os
-import shutil
-from django.conf import settings
-from rest_framework.response import Response
-from rest_framework import status
-import pandas as pd
 
 def handle_validated_upload(uploaded_file, obj, object_name):
     # ✅ Ensure directory exists
-    base_dir = os.path.join(settings.MEDIA_ROOT, object_name)
+    base_dir = os.path.join(settings.MEDIA_ROOT, str(object_name).lower())
     archive_dir = os.path.join(base_dir, "archive")
     os.makedirs(base_dir, exist_ok=True)
     os.makedirs(archive_dir, exist_ok=True)
+
+    print('<<<<<<<<<<<<<<------')
+    # print(os.getcwd())
+    print(os.listdir(base_dir))
+    print('--------->>>>>>>>>>>>>')
 
     # Paths
     main_file_path = os.path.join(base_dir, f"{object_name}.xlsx")
@@ -1000,6 +936,39 @@ def handle_validated_upload(uploaded_file, obj, object_name):
 
 
 class FileUploadAPIView(APIView):
+
+    def get(self, request, id=None):
+        """
+        If object_id is given → return files for that DataObject.
+        Otherwise → return all uploaded files.
+        """
+        context = {
+            "success": 1,
+            "message": "",
+            "data": [],
+        }
+
+        try:
+            object_id = id
+            if object_id:
+                files = DataFile.objects.filter(data_object_id=object_id).order_by("-uploaded_at")
+                context["message"] = f"Files for DataObject ID {object_id} retrieved successfully"
+            else:
+                files = DataFile.objects.filter(version=0).order_by("-uploaded_at")
+                context["message"] = "All files retrieved successfully"
+
+            print('files...->>>>>>>>>>>>>>>>>>>>\n',files)
+            serializer = serializers.DataFileSerializer(files, many=True)
+            context["data"] = serializer.data
+
+            return Response(context, status=status.HTTP_200_OK)
+
+        except Exception as e:
+            context["success"] = 0
+            context["message"] = f"Error: {str(e)}"
+            return Response(context, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
     def post(self, request):
         serializer = FileUploadSerializer(data=request.data)
         if not serializer.is_valid():
@@ -1047,7 +1016,14 @@ class FileUploadAPIView(APIView):
             file_tabs.remove("mapping")
 
         expected_tab_names = set(expected_tabs.keys())
-        missing_tabs = expected_tab_names - file_tabs
+        missing_tabs = False
+        for tab in expected_tab_names:
+            if tab in file_tabs:
+                pass
+            else:
+                missing_tabs = True
+                break
+        # missing_tabs = expected_tab_names - file_tabs
 
         if missing_tabs:
             return Response(
@@ -1079,3 +1055,161 @@ class FileUploadAPIView(APIView):
                     status=status.HTTP_400_BAD_REQUEST,
                 )
         return handle_validated_upload(uploaded_file, obj, object_name)
+
+    def delete(self, request, id):
+        try:
+            file_obj = DataFile.objects.get(pk=id)
+            temp = ''
+            for i in str(file_obj.file_name):
+                if i!='.':
+                    temp = temp + i
+                else:
+                    break
+            file_name = str(file_obj.file_name)   # e.g., "employees.xlsx"
+            media_root = settings.MEDIA_ROOT + str(temp)     # e.g., "FileData/customer"
+            file_path = os.path.join(media_root, file_name)  # Full path with filename
+
+            archive_dir = os.path.join(media_root, "archive")
+            deleted_dir = os.path.join(archive_dir, "delete")
+
+            os.makedirs(archive_dir, exist_ok=True)
+            os.makedirs(deleted_dir, exist_ok=True)
+
+            # 🔹 Find last version
+            last_version = (
+                DataFile.objects.filter(data_object=file_obj.data_object)
+                .order_by("-version")
+                .first()
+            )
+            next_version = (last_version.version if last_version else 0) + 1
+
+            base_name, ext = os.path.splitext(file_name)
+            versioned_filename = f"{base_name}_v{next_version}{ext}"
+
+            archived_path = os.path.join(archive_dir, versioned_filename)
+            deleted_path = os.path.join(deleted_dir, versioned_filename)
+
+            if os.path.exists(file_path):
+                shutil.move(file_path, archived_path)   # Move file to archive
+                shutil.copy2(archived_path, deleted_path)  # Copy also into delete
+
+            # 🔹 Update DB
+            file_obj.version = next_version
+            file_obj.file_name = versioned_filename
+            file_obj.save()
+
+
+            serializer = serializers.DataFileSerializer(file_obj)
+            return Response(
+                {
+                    "success": 1,
+                    "message": "File archived and copied to deleted folder with new version",
+                    "data": serializer.data,
+                },
+                status=status.HTTP_200_OK,
+            )
+
+        except DataFile.DoesNotExist:
+            return Response(
+                {"success": 0, "message": "File not found"},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        except Exception as e:
+            return Response(
+                {"success": 0, "message": str(e)},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+class DataFileLatestView(APIView):
+    def get(self, request, object_id):
+        try:
+            mode = request.query_params.get("mode", "view")  # default = view
+
+            latest_file = (
+                DataFile.objects.filter(data_object_id=object_id, version=0)
+                .first()
+            )
+            if not latest_file:
+                return Response(
+                    {"success": 0, "message": "No file found", "data": {}},
+                    status=status.HTTP_404_NOT_FOUND,
+                )
+
+            # Extract file path
+            file_name = str(latest_file.file_name)   # e.g., "employees.xlsx"
+            object_name = file_name.split(".")[0]
+            media_root = os.path.join(settings.MEDIA_ROOT, object_name.lower())
+            file_path = os.path.join(media_root, file_name)
+
+            if not os.path.exists(file_path):
+                return Response(
+                    {"success": 0, "message": "File not found in storage", "data": {}},
+                    status=status.HTTP_404_NOT_FOUND,
+                )
+
+            # ----------------
+            # Mode 1: VIEW
+            # ----------------
+            if mode == "view":
+                data = {}
+                if file_path.endswith(".xlsx"):
+                    xls = pd.ExcelFile(file_path)
+                    for sheet in xls.sheet_names:
+                        df = xls.parse(sheet)
+                        fields = df.columns.tolist()
+                        data[sheet] = {"fields": fields}
+
+                return Response(
+                    {
+                        "success": 1,
+                        "message": "Latest file data retrieved successfully",
+                        "data": data,
+                    },
+                    status=status.HTTP_200_OK,
+                )
+
+            # ----------------
+            # Mode 2: DOWNLOAD
+            # ----------------
+            elif mode == "download":
+                # Load Excel into Pandas
+                xls = pd.ExcelFile(file_path)
+
+                # Create a BytesIO buffer to hold new Excel
+                output = io.BytesIO()
+                with pd.ExcelWriter(output, engine="openpyxl") as writer:
+                    # Copy existing sheets
+                    for sheet in xls.sheet_names:
+                        df = xls.parse(sheet)
+                        df.to_excel(writer, sheet_name=sheet, index=False)
+                    objectNameId = (models.DataObject.objects.filter(objectName=object_name).first()).id
+                    # Add mapping tab
+                    spec_data = models.Specs.objects.filter(objectName=objectNameId).values()
+                    spec_df = pd.DataFrame(spec_data)
+                    spec_df = spec_df.drop(columns=["id", "position"], errors="ignore")
+                    # Rename FK field "objectName_id" → "objectName"
+                    spec_df = spec_df.rename(columns={"objectName_id": "objectName"})
+                    spec_df["objectName"] = object_name   # here objectName is the text you already know
+                    spec_df.to_excel(writer, sheet_name="mapping", index=False)
+
+                output.seek(0)
+
+                # Send as downloadable response
+                response = HttpResponse(
+                    output,
+                    content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+                response["Content-Disposition"] = f'attachment; filename="{file_name}"'
+                return response
+
+            else:
+                return Response(
+                    {"success": 0, "message": "Invalid mode", "data": {}},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+        except Exception as e:
+            return Response(
+                {"success": 0, "message": f"Error: {str(e)}", "data": {}},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )

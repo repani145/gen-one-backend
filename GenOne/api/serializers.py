@@ -85,3 +85,11 @@ from rest_framework import serializers
 class FileUploadSerializer(serializers.Serializer):
     objectName = serializers.CharField()
     file = serializers.FileField()
+
+
+from . import models
+class DataFileSerializer(serializers.ModelSerializer):
+    uploaded_at = serializers.DateTimeField(format="%Y-%m-%d %H:%M:%S")
+    class Meta:
+        model = models.DataFile
+        fields = "__all__"
