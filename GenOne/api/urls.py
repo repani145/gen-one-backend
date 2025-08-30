@@ -37,6 +37,8 @@ urlpatterns = [
 
      path("rule_by_spec_id/<int:spec_id>/", views.RuleAppliedBySpecView.as_view(), name="rule-by-spec-id"),
         #TO GET ALL RULES APPLIED TO A PARTICULAR SPEC ID
+
+    path("upload-file/", views.FileUploadAPIView.as_view(), name="upload-file"),
 ]
 
 

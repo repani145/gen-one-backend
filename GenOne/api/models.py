@@ -84,3 +84,10 @@ class RuleApplied(models.Model):
     def __str__(self):
         return f"{self.rule_applied} (Spec ID: {self.spec})"
 
+class DataFile(models.Model):
+    data_object = models.ForeignKey("DataObject", on_delete=models.CASCADE, related_name="files")
+    file_name = models.TextField()
+    status = models.CharField(max_length=50)
+    uploaded_at = models.DateTimeField(auto_now_add=True)
+    version = models.IntegerField(default=1)
+    # file = models.FileField(upload_to='uploads/')  # Ensure MEDIA_ROOT is set in settings.py

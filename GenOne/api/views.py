@@ -931,3 +931,151 @@ class RuleAppliedBySpecView(APIView):
             context["message"] = f"Failed to fetch rules: {str(e)}"
 
         return Response(context, status=status.HTTP_200_OK)
+
+from rest_framework.views import APIView
+from rest_framework.response import Response
+from rest_framework import status
+import pandas as pd
+import os
+from django.conf import settings
+from .models import DataObject, DataFile, Specs
+from .serializers import FileUploadSerializer
+from . import constants
+
+import os
+import shutil
+from django.conf import settings
+from rest_framework.response import Response
+from rest_framework import status
+import pandas as pd
+
+def handle_validated_upload(uploaded_file, obj, object_name):
+    # ✅ Ensure directory exists
+    base_dir = os.path.join(settings.MEDIA_ROOT, object_name)
+    archive_dir = os.path.join(base_dir, "archive")
+    os.makedirs(base_dir, exist_ok=True)
+    os.makedirs(archive_dir, exist_ok=True)
+
+    # Paths
+    main_file_path = os.path.join(base_dir, f"{object_name}.xlsx")
+
+    # 🔥 Check if a main file already exists
+    if os.path.exists(main_file_path):
+        # Get last version
+        last_file = models.DataFile.objects.filter(data_object=obj).order_by("-version").first()
+        next_version = last_file.version + 1 if last_file else 1
+
+        # Move existing main file → archive
+        archive_name = f"{object_name}_v{next_version}.xlsx"
+        archive_path = os.path.join(archive_dir, archive_name)
+        shutil.move(main_file_path, archive_path)
+
+        # Update previous DB record version
+        models.DataFile.objects.filter(
+            data_object=obj, file_name=f"{object_name}.xlsx"
+        ).update(file_name=archive_name, version=next_version)
+
+    # ✅ Save the new file as main (objectName.xlsx)
+    with open(main_file_path, "wb+") as dest:
+        for chunk in uploaded_file.chunks():
+            dest.write(chunk)
+
+    # 🔥 Create DB record for the new main file (no version)
+    models.DataFile.objects.create(
+        data_object=obj,
+        file_name=f"{object_name}.xlsx",
+        status=constants.STATUS_UPLOAD_SUCCESS,
+        version=0,  # version 0 means "main/latest"
+    )
+
+    return Response(
+        {
+            "success": 1,
+            "message": f"File uploaded and validated successfully for {object_name}",
+            "file_name": f"{object_name}.xlsx",
+            "status": constants.STATUS_UPLOAD_SUCCESS,
+        },
+        status=status.HTTP_200_OK,
+    )
+
+
+class FileUploadAPIView(APIView):
+    def post(self, request):
+        serializer = FileUploadSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        object_name = serializer.validated_data['objectName']
+        uploaded_file = serializer.validated_data['file']
+
+        # Validate objectName exists
+        try:
+            obj = DataObject.objects.get(objectName=object_name)
+        except DataObject.DoesNotExist:
+            return Response(
+                {"success": 0, "message": f"Object '{object_name}' not found"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # Get Specs for objectName
+        specs = Specs.objects.filter(objectName=obj)
+        if not specs.exists():
+            return Response(
+                {"success": 0, "message": f"No specs defined for '{object_name}'"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # Build expected {tab: set(fields)}
+        expected_tabs = {}
+        for s in specs:
+            expected_tabs.setdefault(s.tab, set()).add(s.field_id)
+
+        # Try reading uploaded Excel file
+        try:
+            xls = pd.ExcelFile(uploaded_file)
+        except Exception as e:
+            return Response(
+                {"success": 0, "message": f"Invalid Excel file: {str(e)}"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        
+                
+        # Step 1: Tab validation (ignore "mapping" tab if present)
+        file_tabs = set(xls.sheet_names)
+
+        if "mapping" in file_tabs:
+            file_tabs.remove("mapping")
+
+        expected_tab_names = set(expected_tabs.keys())
+        missing_tabs = expected_tab_names - file_tabs
+
+        if missing_tabs:
+            return Response(
+                {
+                    "success": 0,
+                    "message": "Missing required tabs",
+                    "expected_tabs": list(expected_tab_names),
+                    "file_tabs": list(file_tabs),
+                    "missing_tabs": list(missing_tabs),
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # Step 2: Field validation per tab (only check expected fields exist)
+        for tab, expected_fields in expected_tabs.items():
+            df = pd.read_excel(xls, sheet_name=tab, nrows=1)  # just header row
+            file_fields = set(df.columns.astype(str))
+
+            missing_fields = set(expected_fields) - file_fields
+            if missing_fields:
+                return Response(
+                    {
+                        "success": 0,
+                        "message": f"Missing required fields in tab '{tab}'",
+                        "expected_fields": list(expected_fields),
+                        "file_fields": list(file_fields),
+                        "missing_fields": list(missing_fields),
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+        return handle_validated_upload(uploaded_file, obj, object_name)

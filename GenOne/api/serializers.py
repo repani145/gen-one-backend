@@ -80,3 +80,8 @@ class RuleAppliedTableSerializer(serializers.ModelSerializer):
 class RuleAppliedNameSerializer(serializers.Serializer):
     rule_applied = serializers.CharField()
 
+from rest_framework import serializers
+
+class FileUploadSerializer(serializers.Serializer):
+    objectName = serializers.CharField()
+    file = serializers.FileField()

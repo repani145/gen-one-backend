@@ -188,3 +188,5 @@ SIMPLE_JWT = {
 
     "JTI_CLAIM": "jti",
 }
+
+MEDIA_ROOT = 'FileData/'
