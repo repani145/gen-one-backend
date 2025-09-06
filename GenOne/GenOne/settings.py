@@ -190,3 +190,8 @@ SIMPLE_JWT = {
 }
 
 MEDIA_ROOT = 'FileData/'
+
+
+TIME_ZONE = "Asia/Kolkata"   # IST
+USE_TZ = False                # keep timezone-aware datetimes
+

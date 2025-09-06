@@ -42,7 +42,24 @@ urlpatterns = [
     path("handle-file/<int:id>/", views.FileUploadAPIView.as_view(), name="handle-file-id"), # get single record,delete 
     # post,get(#handle-files/<int:object_id>/)
 
-    path("file-data/<int:object_id>/",views.DataFileLatestView.as_view(),name='file-data-view')
+    path("file-data/<int:object_id>/",views.DataFileLatestView.as_view(),name='file-data-view'),
+
+    path("latest_validated_file/", views.LatestValidatedFilesView.as_view(), name="latest_validated_file"),
+
+    path("pre_validation_check/<int:data_object_id>/", views.PreValidationCheckAndValidationView.as_view(), name="file-versions"),
+
+    path("logs-view/<str:object_name>/", views.GetLatestLogDataView.as_view(), name="view-latest-log"),
+
+    path("upload-status/<str:upload_id>/", views.UploadStatusView.as_view(), name="upload_status"),
+
+    path('validation-progress/<task_id>/',views.ValidationProgressView.as_view(),name = 'validation-progress'),
+
+    # path('specs_with_rules/<int:objectName_id>/',views.SpecWithRulesDetailView.as_view(),name='specs_with_rules'),
+    # GET /api/spec_with_rules/5/?tab=General
+    # path("validation-progress/<int:object_id>/", views.ValidationProgressView.as_view(), name="validation-progress"),
+
+     # Get current validation progress for a DataObject
+    # path("validation/progress/<int:object_id>/",views.ValidationProgressView.as_view(), name="validation-progress"),
 ]
 
 

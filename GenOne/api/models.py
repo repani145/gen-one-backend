@@ -90,4 +90,39 @@ class DataFile(models.Model):
     status = models.CharField(max_length=50)
     uploaded_at = models.DateTimeField(auto_now_add=True)
     version = models.IntegerField(default=1)
+    validation = models.IntegerField(max_length=50, default=0)  # e.g., Pending, Validated, Failed
+    validated_at = models.DateTimeField(blank=True, null=True)
     # file = models.FileField(upload_to='uploads/')  # Ensure MEDIA_ROOT is set in settings.py
+
+    def __str__(self):
+        return f"{self.file_name}"
+
+class DeletedFileRecord(models.Model):
+    data_file = models.ForeignKey("DataFile", on_delete=models.CASCADE, related_name="deleted_files")
+    deleted_at = models.DateTimeField(auto_now_add=True)
+
+class FileValidationLog(models.Model):
+    data_file = models.ForeignKey("DataFile", on_delete=models.CASCADE, related_name="validation_logs")
+    log_file_name = models.TextField()
+    created_at = models.DateTimeField(auto_now_add=True)
+    def __str__(self):
+        return f"{self.log_file_name}"
+
+
+# models.py
+from django.db import models
+from django.contrib.auth.models import User
+
+class ValidationProgress(models.Model):
+    data_object = models.ForeignKey(DataObject, on_delete=models.CASCADE, related_name="progresses")
+    task_id = models.CharField(max_length=255, null=True, blank=True)  # Celery / async task id if using
+    progress = models.IntegerField(default=0)  # 0 → 100
+    status = models.CharField(
+        max_length=50,
+        choices=[("pending", "Pending"), ("running", "Running"), ("completed", "Completed"), ("failed", "Failed")],
+        default="pending",
+    )
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f"{self.data_object.objectName} - {self.progress}%"

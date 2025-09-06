@@ -1,3 +1,4 @@
+
 # views.py
 import os
 import io
@@ -314,32 +315,44 @@ class SpecsAPIView(APIView):
                 .filter(objectName_id=object_id)
                 .order_by("tab", "position")
             )
-            # print(models.DataObject.objects.get(id=object_id).objectName)
 
             if not specs.exists():
                 context["success"] = 1
                 context["message"] = "No specs data exists"
                 context["data"] = {
-                    'objectName':models.DataObject.objects.get(id=object_id).objectName
+                    "objectName": models.DataObject.objects.get(id=object_id).objectName
                 }
                 return Response(context, status=status.HTTP_200_OK)
 
             grouped_data = defaultdict(list)
             for spec in specs:
+                # 🔹 Get rules applied for this spec
+                rules_qs = models.RuleApplied.objects.filter(spec=spec)
+                rules_data = [
+                    {
+                        "id": rule.id,
+                        "rule_applied": rule.rule_applied,
+                        "description": rule.description,
+                        "rule_applied_data": rule.rule_applied_data,
+                    }
+                    for rule in rules_qs
+                ]
+
                 grouped_data[spec.tab].append({
                     "id": spec.id,
                     "company": spec.company,
-                    "field_id": spec.field_id,
+                    "field_id": (spec.field_id).upper(),  # to upper case
                     "mandatory": spec.mandatory,
                     "allowed_values": spec.allowed_values,
                     "sap_table": spec.sap_table,
                     "sap_field_id": spec.sap_field_id,
                     "sap_description": spec.sap_description,
-                    "position": spec.position,   # include position
+                    "position": spec.position,
+                    "rules": rules_data,   # 🔹 Add rules here
                 })
 
             tab_data = [
-                {"tab": tab_name, "fields": fields}
+                {"tab": (tab_name).lower(), "fields": fields}
                 for tab_name, fields in grouped_data.items()
             ]
 
@@ -358,7 +371,7 @@ class SpecsAPIView(APIView):
             context["message"] = str(e)
             context["data"] = {}
             return Response(context, status=status.HTTP_400_BAD_REQUEST)
-        
+
     def post(self, request, *args, **kwargs):
         context = {"success": 1, "message": "Data saved successfully", "data": {}}
         try:
@@ -704,7 +717,7 @@ class RuleAppliedView(APIView):
         try:
             data = request.data
             # 1️⃣ Extract source_fields from payload
-            source_fields = data.get("rule_applied_data", {}).get("source_fields", {})
+            source_fields = data.get("rule_applied_data", {}).get("source", {})
             spec_id = models.DataObject.objects.get(objectName=source_fields.get("spec")).id
 
             # 2️⃣ Find matching Specs record
@@ -879,6 +892,36 @@ class RuleAppliedBySpecView(APIView):
 
         return Response(context, status=status.HTTP_200_OK)
 
+import pandas as pd
+import io
+from django.core.files.uploadedfile import InMemoryUploadedFile
+
+def clean_excel(uploaded_file):
+    """Return a cleaned Excel file object without 'mapping' sheet."""
+    xls = pd.ExcelFile(uploaded_file)
+
+    # write cleaned file to memory (BytesIO)
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        for sheet_name in xls.sheet_names:
+            if sheet_name.lower() != "mapping":
+                df = pd.read_excel(uploaded_file, sheet_name=sheet_name)
+                df.to_excel(writer, sheet_name=sheet_name, index=False)
+
+    output.seek(0)  # reset pointer to start
+
+    # Wrap as InMemoryUploadedFile so Django treats it like a real upload
+    cleaned_file = InMemoryUploadedFile(
+        file=output,
+        field_name="file",
+        name="cleaned_file.xlsx",
+        content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        size=output.getbuffer().nbytes,
+        charset=None,
+    )
+
+    return cleaned_file
+
 
 def handle_validated_upload(uploaded_file, obj, object_name):
     # ✅ Ensure directory exists
@@ -934,7 +977,18 @@ def handle_validated_upload(uploaded_file, obj, object_name):
         status=status.HTTP_200_OK,
     )
 
+import tempfile
+from django.core.files import File
+import uuid, threading, time
+from django.core.files.base import File
+from rest_framework.views import APIView
+from rest_framework.response import Response
+from rest_framework import status
+import pandas as pd, tempfile
+from .models import DataObject, Specs
 
+# In-memory progress store (better: Redis/DB in production)
+UPLOAD_PROGRESS = {}
 class FileUploadAPIView(APIView):
 
     def get(self, request, id=None):
@@ -968,93 +1022,141 @@ class FileUploadAPIView(APIView):
             context["message"] = f"Error: {str(e)}"
             return Response(context, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
-
     def post(self, request):
+        # print("📥 Received POST request to handle-file API")
         serializer = FileUploadSerializer(data=request.data)
         if not serializer.is_valid():
+            # print("❌ Serializer validation failed:", serializer.errors)
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
-        object_name = serializer.validated_data['objectName']
-        uploaded_file = serializer.validated_data['file']
+        object_name = serializer.validated_data["objectName"]
+        uploaded_file = serializer.validated_data["file"]
+        # print(f"✅ Serializer validated | objectName={object_name}, file={uploaded_file.name}")
+
+        # Save uploaded file temporarily
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp:
+            temp_file_path = tmp.name
+            for chunk in uploaded_file.chunks():
+                tmp.write(chunk)
+        # print(f"📂 Temp file saved at {temp_file_path}")
 
         # Validate objectName exists
         try:
-            obj = DataObject.objects.get(objectName=object_name)
-        except DataObject.DoesNotExist:
+            obj = models.DataObject.objects.get(objectName=object_name)
+            # print(f"✅ DataObject found: {obj}")
+        except models.DataObject.DoesNotExist:
+            # print(f"❌ DataObject '{object_name}' not found in DB")
             return Response(
                 {"success": 0, "message": f"Object '{object_name}' not found"},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        # Get Specs for objectName
+        # Specs check
         specs = Specs.objects.filter(objectName=obj)
         if not specs.exists():
+            # print(f"❌ No specs defined for '{object_name}'")
             return Response(
                 {"success": 0, "message": f"No specs defined for '{object_name}'"},
                 status=status.HTTP_400_BAD_REQUEST,
             )
+        # print(f"✅ Specs found for '{object_name}' | count={specs.count()}")
 
-        # Build expected {tab: set(fields)}
-        expected_tabs = {}
-        for s in specs:
-            expected_tabs.setdefault(s.tab, set()).add(s.field_id)
+        # Create unique upload ID
+        upload_id = str(uuid.uuid4())
+        UPLOAD_PROGRESS[upload_id] = {"progress": 0, "message": "Started processing...", "success": None}
+        # print(f"🚀 Upload started | upload_id={upload_id}")
 
-        # Try reading uploaded Excel file
-        try:
-            xls = pd.ExcelFile(uploaded_file)
-        except Exception as e:
-            return Response(
-                {"success": 0, "message": f"Invalid Excel file: {str(e)}"},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-        
-                
-        # Step 1: Tab validation (ignore "mapping" tab if present)
-        file_tabs = set(xls.sheet_names)
+        # Process file in background
+        def process_file():
+            try:
+                # Step 1: Building expected tabs
+                # print(f"[{upload_id}] 🔄 Step 1: Building expected tabs")
+                for p in range(1, 11):
+                    UPLOAD_PROGRESS[upload_id] = {"progress": p, "message": "Validating specs...", "success": None}
+                    time.sleep(0.05)
 
-        if "mapping" in file_tabs:
-            file_tabs.remove("mapping")
+                expected_tabs = {}
+                for s in specs:
+                    expected_tabs.setdefault(s.tab.lower(), set()).add(s.field_id.upper())
+                # print(f"[{upload_id}] ✅ Expected tabs: {list(expected_tabs.keys())}")
 
-        expected_tab_names = set(expected_tabs.keys())
-        missing_tabs = False
-        for tab in expected_tab_names:
-            if tab in file_tabs:
-                pass
-            else:
-                missing_tabs = True
-                break
-        # missing_tabs = expected_tab_names - file_tabs
+                # Step 2: Reading Excel
+                # print(f"[{upload_id}] 🔄 Reading Excel file {temp_file_path}")
+                try:
+                    xls = pd.ExcelFile(temp_file_path)
+                    # print(f"[{upload_id}] ✅ Sheets found: {xls.sheet_names}")
+                except Exception as e:
+                    # print(f"[{upload_id}] ❌ Failed to read Excel file:", e)
+                    UPLOAD_PROGRESS[upload_id] = {"progress": -1, "message": "Failed to read Excel file", "success": 0}
+                    return
 
-        if missing_tabs:
-            return Response(
-                {
-                    "success": 0,
-                    "message": "Missing required tabs",
-                    "expected_tabs": list(expected_tab_names),
-                    "file_tabs": list(file_tabs),
-                    "missing_tabs": list(missing_tabs),
-                },
-                status=status.HTTP_400_BAD_REQUEST,
-            )
+                for p in range(11, 31):
+                    UPLOAD_PROGRESS[upload_id] = {"progress": p, "message": "Preparing file...", "success": None}
+                    time.sleep(0.05)
 
-        # Step 2: Field validation per tab (only check expected fields exist)
-        for tab, expected_fields in expected_tabs.items():
-            df = pd.read_excel(xls, sheet_name=tab, nrows=1)  # just header row
-            file_fields = set(df.columns.astype(str))
+                # Step 3: Normalizing
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp:
+                    cleaned_file_path = tmp.name
+                    with pd.ExcelWriter(cleaned_file_path, engine="openpyxl") as writer:
+                        for sheet_name in xls.sheet_names:
+                            if sheet_name.lower() == "mapping":
+                                print(f"[{upload_id}] ⚠️ Skipping 'mapping' sheet")
+                                continue
+                            df = pd.read_excel(xls, sheet_name=sheet_name)
+                            df.columns = [str(col).upper() for col in df.columns]
+                            df.to_excel(writer, sheet_name=sheet_name.lower(), index=False)
+                    # print(f"[{upload_id}] ✅ Normalized file written to {cleaned_file_path}")
 
-            missing_fields = set(expected_fields) - file_fields
-            if missing_fields:
-                return Response(
-                    {
-                        "success": 0,
-                        "message": f"Missing required fields in tab '{tab}'",
-                        "expected_fields": list(expected_fields),
-                        "file_fields": list(file_fields),
-                        "missing_fields": list(missing_fields),
-                    },
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
-        return handle_validated_upload(uploaded_file, obj, object_name)
+                for p in range(31, 61):
+                    UPLOAD_PROGRESS[upload_id] = {"progress": p, "message": "Validating tabs & fields...", "success": None}
+                    time.sleep(0.05)
+
+                # Step 4: Validate tabs
+                cleaned_xls = pd.ExcelFile(cleaned_file_path)
+                file_tabs = set(cleaned_xls.sheet_names)
+                # print(f"[{upload_id}] ✅ Normalized file sheets: {file_tabs}")
+
+                expected_tab_names = set(expected_tabs.keys())
+                missing_tabs = expected_tab_names - file_tabs
+                if missing_tabs:
+                    # print(f"[{upload_id}] ❌ Missing tabs: {missing_tabs}")
+                    UPLOAD_PROGRESS[upload_id] = {"progress": -1, "message": f"Missing required tabs...❌", "success": 0}
+                    return
+
+                for tab, expected_fields in expected_tabs.items():
+                    df = pd.read_excel(cleaned_xls, sheet_name=tab, nrows=1)
+                    file_fields = set(df.columns.astype(str).str.upper())
+                    missing_fields = expected_fields - file_fields
+                    if missing_fields:
+                        # print(f"[{upload_id}] ❌ Missing fields in {tab}: {missing_fields}")
+                        UPLOAD_PROGRESS[upload_id] = {"progress": -1, "message": f"Missing fields in '{tab}'", "success": 0}
+                        return
+                # print(f"[{upload_id}] ✅ All required fields present")
+
+                for p in range(61, 91):
+                    UPLOAD_PROGRESS[upload_id] = {"progress": p, "message": "Saving validated file...", "success": None}
+                    time.sleep(0.05)
+
+                # Step 5: Save normalized file
+                with open(cleaned_file_path, "rb") as f:
+                    cleaned_file = File(f, name=f"{object_name.lower()}_cleaned.xlsx")
+                    handle_validated_upload(cleaned_file, obj, object_name)
+                # print(f"[{upload_id}] 📤 File uploaded successfully to DB/storage")
+
+                # Step 6: Finalizing
+                for p in range(91, 101):
+                    UPLOAD_PROGRESS[upload_id] = {"progress": p, "message": "Finalizing...", "success": None}
+                    time.sleep(0.05)
+
+                UPLOAD_PROGRESS[upload_id] = {"progress": 100, "message": "Upload completed successfully! 🎉", "success": 1}
+                # print(f"[{upload_id}] 🎉 Upload finished successfully")
+
+            except Exception as e:
+                # print(f"[{upload_id}] ❌ Exception during processing:", e)
+                UPLOAD_PROGRESS[upload_id] = {"progress": -1, "message": str(e), "success": 0}
+
+        threading.Thread(target=process_file).start()
+        return Response({"success": 1, "upload_id": upload_id}, status=status.HTTP_200_OK)
 
     def delete(self, request, id):
         try:
@@ -1098,6 +1200,9 @@ class FileUploadAPIView(APIView):
             file_obj.file_name = versioned_filename
             file_obj.save()
 
+            models.DeletedFileRecord.objects.create(
+                data_file=file_obj).save()
+
 
             serializer = serializers.DataFileSerializer(file_obj)
             return Response(
@@ -1120,50 +1225,108 @@ class FileUploadAPIView(APIView):
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
 
+
+class UploadStatusView(APIView):
+    def get(self, request, upload_id):
+        progress = UPLOAD_PROGRESS.get(upload_id, 0)
+        print(progress,'.....................................................................................')
+        return Response({"upload_id": upload_id, "progress": progress})
+
+
+
+from math import isfinite
+
+def sanitize_data(data):
+    if isinstance(data, dict):
+        return {k: sanitize_data(v) for k, v in data.items()}
+    elif isinstance(data, list):
+        return [sanitize_data(i) for i in data]
+    elif isinstance(data, float):
+        return data if isfinite(data) else 0  # or None
+    else:
+        return data
+
+# In your view
+
+
+
 class DataFileLatestView(APIView):
     def get(self, request, object_id):
         try:
             mode = request.query_params.get("mode", "view")  # default = view
-
-            latest_file = (
-                DataFile.objects.filter(data_object_id=object_id, version=0)
+            print("\n[DEBUG] Incoming GET request ----------------------")
+            print("[DEBUG] object_id:", object_id)
+            print("[DEBUG] mode:", mode)
+            if mode == 'download':
+                latest_file = (
+                models.DataFile.objects.filter(id=object_id, version=0)
                 .first()
-            )
+                )
+            else:
+                latest_file = (
+                    models.DataFile.objects.filter(data_object_id=object_id, version=0)
+                    .first()
+                )
+
+            print("[DEBUG] latest_file object:", latest_file)
+
             if not latest_file:
+                print("[DEBUG] No DataFile found for object_id:", object_id)
                 return Response(
                     {"success": 0, "message": "No file found", "data": {}},
                     status=status.HTTP_404_NOT_FOUND,
                 )
 
-            # Extract file path
-            file_name = str(latest_file.file_name)   # e.g., "employees.xlsx"
-            object_name = file_name.split(".")[0]
-            media_root = os.path.join(settings.MEDIA_ROOT, object_name.lower())
-            file_path = os.path.join(media_root, file_name)
+            # Serialize the latest file
+            serializer = serializers.DataFileSerializer(latest_file)
+            safe_data = sanitize_data(serializer.data)
+            print("[DEBUG] Serialized DataFile:", safe_data)
 
-            if not os.path.exists(file_path):
-                return Response(
-                    {"success": 0, "message": "File not found in storage", "data": {}},
-                    status=status.HTTP_404_NOT_FOUND,
-                )
+            # Extract file path
+            file_name = str(latest_file.file_name)
+            print("[DEBUG] file_name:", file_name)
+
+            object_name = file_name.split(".")[0]
+            print("[DEBUG] object_name (from file_name):", object_name)
+
+            base_dir = os.path.join(settings.MEDIA_ROOT, str(object_name).lower())
+            print("[DEBUG] base_dir:", base_dir)
+
+            file_path = os.path.normpath(os.path.join(base_dir, file_name))
+            print("[DEBUG] file_path:", file_path)
 
             # ----------------
             # Mode 1: VIEW
             # ----------------
             if mode == "view":
+                print("[DEBUG] Entered VIEW mode")
                 data = {}
-                if file_path.endswith(".xlsx"):
-                    xls = pd.ExcelFile(file_path)
-                    for sheet in xls.sheet_names:
-                        df = xls.parse(sheet)
-                        fields = df.columns.tolist()
-                        data[sheet] = {"fields": fields}
+                if file_path.endswith(".xlsx") and os.path.exists(file_path):
+                    print("[DEBUG] File exists, opening with pandas:", file_path)
+                    with pd.ExcelFile(file_path) as xls:
+                        print("[DEBUG] Sheets found:", xls.sheet_names)
+                        for sheet in xls.sheet_names:
+                            df = xls.parse(sheet)
+                            fields = df.columns.tolist()
+                            top_rows = df.head(30).to_dict(orient="records")
+                            safe_rows = sanitize_data(top_rows)
+                            data[sheet] = {
+                                "fields": fields,
+                                "rows": safe_rows
+                            }
+                            print(f"[DEBUG] Processed sheet: {sheet}, rows: {len(df)}")
+
+                else:
+                    print("[DEBUG] File missing or not .xlsx:", file_path)
 
                 return Response(
                     {
                         "success": 1,
                         "message": "Latest file data retrieved successfully",
-                        "data": data,
+                        "data": {
+                            "file_info": safe_data,
+                            "excel_preview": data
+                        },
                     },
                     status=status.HTTP_200_OK,
                 )
@@ -1172,29 +1335,46 @@ class DataFileLatestView(APIView):
             # Mode 2: DOWNLOAD
             # ----------------
             elif mode == "download":
-                # Load Excel into Pandas
-                xls = pd.ExcelFile(file_path)
+                print("[DEBUG] Entered DOWNLOAD mode")
+                print("[DEBUG] Checking file path:", file_path)
 
-                # Create a BytesIO buffer to hold new Excel
+                if not os.path.exists(file_path):
+                    print("[DEBUG] File not found at path:", file_path)
+                    return Response(
+                        {"success": 0, "message": "File not found", "data": {}},
+                        status=status.HTTP_404_NOT_FOUND,
+                    )
+
+                print("[DEBUG] File exists, preparing Excel for download...")
+                xls = pd.ExcelFile(file_path)
+                print("[DEBUG] Sheets found:", xls.sheet_names)
+
                 output = io.BytesIO()
                 with pd.ExcelWriter(output, engine="openpyxl") as writer:
-                    # Copy existing sheets
                     for sheet in xls.sheet_names:
                         df = xls.parse(sheet)
                         df.to_excel(writer, sheet_name=sheet, index=False)
-                    objectNameId = (models.DataObject.objects.filter(objectName=object_name).first()).id
+                        print(f"[DEBUG] Copied sheet: {sheet}, rows: {len(df)}")
+
                     # Add mapping tab
-                    spec_data = models.Specs.objects.filter(objectName=objectNameId).values()
-                    spec_df = pd.DataFrame(spec_data)
-                    spec_df = spec_df.drop(columns=["id", "position"], errors="ignore")
-                    # Rename FK field "objectName_id" → "objectName"
-                    spec_df = spec_df.rename(columns={"objectName_id": "objectName"})
-                    spec_df["objectName"] = object_name   # here objectName is the text you already know
-                    spec_df.to_excel(writer, sheet_name="mapping", index=False)
+                    print("[DEBUG] Fetching mapping specs for object_name:", object_name)
+                    objectNameObj = models.DataObject.objects.filter(objectName=object_name).first()
+                    print("[DEBUG] DataObject fetched:", objectNameObj)
+
+                    if objectNameObj:
+                        objectNameId = objectNameObj.id
+                        spec_data = models.Specs.objects.filter(objectName=objectNameId).values()
+                        spec_df = pd.DataFrame(spec_data)
+                        print("[DEBUG] Spec rows:", len(spec_df))
+
+                        spec_df = spec_df.drop(columns=["id", "position"], errors="ignore")
+                        spec_df = spec_df.rename(columns={"objectName_id": "objectName"})
+                        spec_df["objectName"] = object_name
+                        spec_df.to_excel(writer, sheet_name="mapping", index=False)
+                        print("[DEBUG] Added mapping tab")
 
                 output.seek(0)
-
-                # Send as downloadable response
+                print("[DEBUG] Returning Excel file as response")
                 response = HttpResponse(
                     output,
                     content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -1203,13 +1383,425 @@ class DataFileLatestView(APIView):
                 return response
 
             else:
+                print("[DEBUG] Invalid mode:", mode)
                 return Response(
                     {"success": 0, "message": "Invalid mode", "data": {}},
                     status=status.HTTP_400_BAD_REQUEST,
                 )
 
         except Exception as e:
+            print("[ERROR] Exception in get():", str(e))
+            import traceback; traceback.print_exc()
             return Response(
                 {"success": 0, "message": f"Error: {str(e)}", "data": {}},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
+
+# views.py
+from rest_framework.views import APIView
+from rest_framework.response import Response
+from rest_framework import status
+from django.db.models import Max
+from .models import DataFile
+from .serializers import DataFileSerializer
+from django.db.models import Max, Q
+from django.db.models import Exists, OuterRef
+from django.db.models import Exists, OuterRef, Max, Q
+class LatestValidatedFilesView(APIView):
+    ''' Fetch latest validated (validation=1) file per DataObject '''
+    authentication_classes = [JWTAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    from django.db.models import Exists, OuterRef, Max
+
+    def get(self, request):
+        context = {
+            "success": 0,
+            "message": "Something went wrong.",
+            "data": [],
+        }
+        try:
+            # Step 1: Subquery to check if the data_object has any previous validation
+            validated_subquery = models.DataFile.objects.filter(
+                data_object=OuterRef('data_object'),
+                validation=1
+            )
+
+            # Step 2: Fetch version=0 files with previous validation
+            version0_files = models.DataFile.objects.filter(
+                version=0
+            ).annotate(
+                has_previous_validation=Exists(validated_subquery)
+            ).filter(has_previous_validation=True)
+
+            # Step 3: Prepare a dict to track latest file per data_object
+            latest_files_dict = {}
+
+            # Add version=0 files first
+            for file in version0_files:
+                latest_files_dict[file.data_object] = file
+
+            # Step 4: For data_objects without version=0 validated file, fetch latest validated file
+            data_object_ids_with_v0 = version0_files.values_list('data_object', flat=True)
+            fallback_files = (
+                models.DataFile.objects
+                .filter(validation=1)
+                .exclude(data_object__in=data_object_ids_with_v0)
+                .order_by('data_object', '-validated_at')
+            )
+
+            # Add fallback latest file per data_object
+            for file in fallback_files:
+                if file.data_object not in latest_files_dict:
+                    latest_files_dict[file.data_object] = file
+
+            # Step 5: Final list of files (unique per data_object)
+            combined_files = list(latest_files_dict.values())
+
+            serializer = serializers.DataFileSerializer(combined_files, many=True)
+
+            if not serializer.data:
+                context["message"] = "No validated files found."
+                return Response(context, status=status.HTTP_404_NOT_FOUND)
+
+            context["success"] = 1
+            context["message"] = "Latest validated files fetched successfully."
+            context["data"] = serializer.data
+
+            return Response(context, status=status.HTTP_200_OK)
+
+        except Exception as e:
+            context["message"] = str(e)
+            return Response(context, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+from rest_framework.views import APIView
+from rest_framework.response import Response
+from rest_framework import status
+from . import models
+from . CustomValidationFiles.common_rules_validators import run_default_validators
+from . CustomValidationFiles.custom_rule_validator import run_custom_rule_validation
+from . file_utils import get_file_path_with_object_name
+import time
+from . working_file_manager import create_and_get_working_file_path,delete_working_directory
+from django.utils import timezone
+
+from . file_utils import get_target_specs
+
+# #########################################################################
+import uuid
+from datetime import datetime
+import threading
+
+# Global in-memory store for progress objects
+PROGRESS_STORE = {}
+
+def create_progress(task_name: str):
+    task_id = str(uuid.uuid4())
+    progress_obj = {
+        "id": task_id,
+        "task_name": task_name,
+        "progress": 0,
+        "message": "Started",
+        "created_at": datetime.now().isoformat(),
+        "updated_at": datetime.now().isoformat()
+    }
+    PROGRESS_STORE[task_id] = progress_obj
+    print(f"[PROGRESS] Created tracker: {task_id} for task: {task_name}")
+    return task_id, progress_obj
+
+def update_progress(task_id: str, progress: int, message: str = ""):
+    if task_id in PROGRESS_STORE:
+        PROGRESS_STORE[task_id]["progress"] = progress
+        if message:
+            PROGRESS_STORE[task_id]["message"] = message
+        PROGRESS_STORE[task_id]["updated_at"] = datetime.now().isoformat()
+        print(f"[PROGRESS] {task_id} -> {progress}% | {message}")
+
+def get_progress(task_id: str):
+    return PROGRESS_STORE.get(task_id, {"progress": 0, "message": ""})
+
+
+def run_validation_in_background(task_id, data_object_id, request_data):
+    """All heavy validation logic moved here."""
+    try:
+        update_progress(task_id, 5, "Fetching DataObject")
+        print(f"[Thread] Fetching DataObject {data_object_id}")
+        data_object = models.DataObject.objects.filter(id=data_object_id).first()
+        if not data_object:
+            update_progress(task_id, 6, "DataObject not found")
+            print("[Thread ERROR] DataObject not found")
+            return
+
+        # Check own file
+        update_progress(task_id, 6, "Checking main data file")
+        print("[Thread] Checking main data file")
+        own_file_exists = models.DataFile.objects.filter(data_object=data_object, version=0).exists()
+        if not own_file_exists:
+            update_progress(task_id, 7, f"Data file for '{data_object.objectName}' not found")
+            print(f"[Thread ERROR] Data file for '{data_object.objectName}' not found")
+            return
+
+        # Check dependencies
+        update_progress(task_id, 7, "Checking dependencies")
+        print("[Thread] Checking dependencies")
+        dependencies = data_object.dependencies or []
+        rules_applied_qs = models.RuleApplied.objects.filter(spec__objectName=data_object.id)
+        target_objects_dependencies = []
+        for rule in rules_applied_qs:
+            targets = get_target_specs(rule.rule_applied_data)
+            target_objects_dependencies.extend(targets)
+        dependencies = list(set(dependencies + target_objects_dependencies))
+        update_progress(task_id, 8, "verifying depenedency files..")
+
+        missing_files = []
+        for dep_name in dependencies:
+            dep_object = models.DataObject.objects.filter(objectName=dep_name).first()
+            if not dep_object or not models.DataFile.objects.filter(data_object=dep_object, version=0).exists():
+                missing_files.append(dep_name)
+                print(f"[Thread] Missing dependency: {dep_name}")
+        if missing_files:
+            update_progress(task_id, 20, f"Missing dependencies: {', '.join(missing_files)}")
+            print(f"[Thread ERROR] Missing dependencies: {', '.join(missing_files)}")
+            return
+
+        update_progress(task_id, 9, "Dependencies validated")
+        print("[Thread] Dependencies validated")
+
+        # Start default validations
+        update_progress(task_id, 10, "Running default validations")
+        paths = create_and_get_working_file_path(request_data.get("dataObjectId"))
+        print(f"[Thread] Working paths: {paths}")
+        resultLog1 = run_default_validators(
+            file_path=paths.get('working_file_path'),
+            log_file_path=paths.get('log_file_path'),
+            primary_field=request_data.get("fieldId"),
+            task_id=task_id,
+            update_progress_fun=update_progress
+        )
+        update_progress(task_id, 65, "default Validation completed successfully")
+        delete_working_directory(paths.get('working_file_path'))
+        print("[Thread] Deleted working directory")
+
+        # Prepare logs
+        update_progress(task_id, 68, "Processing logs")
+        source_file = get_file_path_with_object_name(data_object.objectName)
+        log_file_path = paths.get('log_file_path')
+        try:
+            with open(log_file_path, "rb") as f:
+                existing_log = pd.read_excel(f)
+            print(f"[Thread] Existing log loaded. Rows: {len(existing_log)}")
+        except FileNotFoundError:
+            existing_log = pd.DataFrame(columns=["primary_field", "rule_data", "time"])
+            print("[Thread] No existing log found, created empty log")
+
+        # Run custom rule validations
+       
+        ###############################################
+        update_progress(task_id, 70, "Running custom rule validations")
+        new_logs_list = []
+        rules_applied_qs = models.RuleApplied.objects.filter(spec__objectName=data_object.id)
+        targets_obj = {}
+        total_rules = rules_applied_qs.count()
+
+        for i, rule in enumerate(rules_applied_qs):
+            targets = get_target_specs(json_spec=rule.rule_applied_data)
+            for obj in targets:
+                targets_obj[obj] = get_file_path_with_object_name(obj)
+            print(f"[Thread] Running custom rule {rule.id} on targets: {targets_obj}")
+
+            resultLog2 = run_custom_rule_validation(
+                rule_name=rule.rule_applied,
+                json_spec=rule.rule_applied_data,
+                source_file=source_file,
+                target_files=targets_obj,
+                rule_description=rule.description or ""
+            )
+            print(f"[Thread] Custom rule {rule.id} produced {len(resultLog2)} logs")
+            new_logs_list.append(pd.DataFrame(resultLog2, columns=["primary_field", "rule_data", "time"]))
+
+            # Update progress for this rule
+            if task_id and total_rules > 0:
+                incremental_progress = int((i + 1) / total_rules * 25)  # 25% for this loop
+                update_progress(task_id, 70 + incremental_progress, f"Running custom rule {i + 1}/{total_rules}")
+
+        ############
+        #######
+        ##########
+        if new_logs_list:
+            all_new_logs = pd.concat(new_logs_list, ignore_index=True)
+            final_log = pd.concat([existing_log, all_new_logs], ignore_index=True)
+        else:
+            final_log = existing_log
+
+        with pd.ExcelWriter(log_file_path, engine="openpyxl", mode="w") as writer:
+            final_log.to_excel(writer, index=False)
+
+        update_progress(task_id, 98, "written in log file successfully !")
+        print("[Thread] Final log written to Excel")
+
+        # Update DataFile validation status
+        data_file = models.DataFile.objects.filter(data_object=data_object, version=0).first()
+        if data_file:
+            data_file.validation = 1
+            data_file.validated_at = timezone.now()
+            data_file.save()
+            print("[Thread] DataFile validation updated")
+
+        update_progress(task_id, 100, "Validation completed successfully")
+        print("[Thread] Validation completed successfully")
+
+    except Exception as e:
+        update_progress(task_id, 0, f"Error: {str(e)}")
+        print(f"[Thread ERROR] {str(e)}")
+
+
+class PreValidationCheckAndValidationView(APIView):
+    authentication_classes = [JWTAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, data_object_id):
+        print(f"\n[API] Validation API called with data_object_id: {data_object_id}")
+        # Create progress tracker
+        task_id, tracker = create_progress(f"Validation-{data_object_id}")
+
+        # Start background thread
+        thread = threading.Thread(
+            target=run_validation_in_background,
+            args=(task_id, data_object_id, request.data),
+            daemon=True
+        )
+        thread.start()
+
+        # Return immediately with task_id
+        return Response({
+            "success": 1,
+            "message": "Validation started",
+            "data": {"task_id": task_id}
+        }, status=status.HTTP_200_OK)
+
+
+class ValidationProgressView(APIView):
+    authentication_classes = [JWTAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, task_id):
+        progress = PROGRESS_STORE.get(task_id, {"progress": 0, "message": "Task not started"})
+        return Response({"success": 1, "data": progress})
+
+
+import os
+import glob
+import pandas as pd
+from django.conf import settings
+from rest_framework.views import APIView
+from rest_framework.response import Response
+from rest_framework import status
+
+
+import os
+import glob
+import pandas as pd
+from django.http import FileResponse
+from rest_framework.views import APIView
+from rest_framework.response import Response
+from rest_framework import status
+from django.conf import settings
+
+class GetLatestLogDataView(APIView):
+    """
+    API to fetch top 30 rows of the latest log data for a given objectName.
+    If `?download=1` is passed, returns the file for download.
+    """
+    authentication_classes = [JWTAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, object_name):
+        context = {
+            "success": 1,
+            "message": "Latest log data retrieved successfully",
+            "data": []
+        }
+        try:
+            # Log directory path
+            log_dir = os.path.join(settings.MEDIA_ROOT, str(object_name).lower(), "Log")
+            if not os.path.exists(log_dir):
+                context["success"] = 0
+                context["message"] = f"No log directory found for {object_name}"
+                return Response(context, status=status.HTTP_404_NOT_FOUND)
+
+            # Get all log files
+            log_files = glob.glob(os.path.join(log_dir, "*.xlsx"))
+            if not log_files:
+                context["success"] = 0
+                context["message"] = f"No log files found for {object_name}"
+                return Response(context, status=status.HTTP_404_NOT_FOUND)
+
+            # Pick latest log file
+            latest_file = max(log_files, key=os.path.getmtime)
+
+            # ✅ If download flag is passed → return file
+            if request.query_params.get("download") == "1":
+                return FileResponse(
+                    open(latest_file, "rb"),
+                    as_attachment=True,
+                    filename=os.path.basename(latest_file),
+                    content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+
+            # Otherwise → return JSON response
+            with open(latest_file, "rb") as f:
+                df = pd.read_excel(f)
+
+            df = df.fillna("").head(50)
+
+            # context["file_name"] = os.path.basename(latest_file)
+            # context["total_rows"] = len(df)
+            context["data"] = df.to_dict(orient="records")
+
+        except Exception as e:
+            context["success"] = 0
+            context["message"] = str(e)
+
+        return Response(context, status=status.HTTP_200_OK if context["success"] else status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+import uuid, time, threading
+from django.http import JsonResponse
+from django.views.decorators.csrf import csrf_exempt
+
+UPLOAD_PROGRESS = {}  # store progress in memory (use Redis/DB in production)
+
+
+def process_file(upload_id, file):
+    """
+    Simulated file processing in background thread.
+    Replace with your actual logic (save file, parse, validate, etc.).
+    """
+    for i in range(0, 101, 20):  # fake steps
+        time.sleep(1)
+        UPLOAD_PROGRESS[upload_id] = i
+
+
+@csrf_exempt
+def handle_file(request):
+    if request.method == "POST":
+        file = request.FILES.get("file")
+        if not file:
+            return JsonResponse({"success": False, "message": "No file uploaded"})
+
+        upload_id = str(uuid.uuid4())
+        UPLOAD_PROGRESS[upload_id] = 0
+
+        # run processing in background thread
+        threading.Thread(target=process_file, args=(upload_id, file)).start()
+
+        return JsonResponse({"success": True, "upload_id": upload_id})
+    return JsonResponse({"success": False, "message": "Invalid method"})
+
+
+def upload_status(request, upload_id):
+    progress = UPLOAD_PROGRESS.get(upload_id, 0)
+    return JsonResponse({"upload_id": upload_id, "progress": progress})
+
+

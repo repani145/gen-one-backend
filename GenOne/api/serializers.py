@@ -93,3 +93,45 @@ class DataFileSerializer(serializers.ModelSerializer):
     class Meta:
         model = models.DataFile
         fields = "__all__"
+
+
+# serializers.py
+from rest_framework import serializers
+from .models import Specs, RuleApplied
+
+class RuleAppliedSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = RuleApplied
+        fields = ["rule_applied", "description"]
+
+class SpecsWithRulesSerializer(serializers.ModelSerializer):
+    rules = RuleAppliedSerializer(many=True, source="ruleapplied_set")
+
+    class Meta:
+        model = Specs
+        fields = [
+            "id",
+            "company",
+            "objectName",
+            "tab",
+            "field_id",
+            "mandatory",
+            "allowed_values",
+            "sap_table",
+            "sap_field_id",
+            "sap_description",
+            "position",
+            "rules",   # 👈 include rules
+        ]
+
+# serializers.py
+from rest_framework import serializers
+from .models import ValidationProgress
+
+class ValidationProgressSerializer(serializers.ModelSerializer):
+    object_id = serializers.IntegerField(source="data_object.id", read_only=True)
+    object_name = serializers.CharField(source="data_object.objectName", read_only=True)
+
+    class Meta:
+        model = ValidationProgress
+        fields = ["object_id", "object_name", "task_id", "progress", "status", "updated_at"]
