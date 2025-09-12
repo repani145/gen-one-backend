@@ -90,6 +90,7 @@ class FileUploadSerializer(serializers.Serializer):
 from . import models
 class DataFileSerializer(serializers.ModelSerializer):
     uploaded_at = serializers.DateTimeField(format="%Y-%m-%d %H:%M:%S")
+    validated_at = serializers.DateTimeField(format="%Y-%m-%d %H:%M:%S")
     class Meta:
         model = models.DataFile
         fields = "__all__"
@@ -99,13 +100,13 @@ class DataFileSerializer(serializers.ModelSerializer):
 from rest_framework import serializers
 from .models import Specs, RuleApplied
 
-class RuleAppliedSerializer(serializers.ModelSerializer):
+class RuleAppliedSerializer2(serializers.ModelSerializer):
     class Meta:
         model = RuleApplied
         fields = ["rule_applied", "description"]
 
 class SpecsWithRulesSerializer(serializers.ModelSerializer):
-    rules = RuleAppliedSerializer(many=True, source="ruleapplied_set")
+    rules = RuleAppliedSerializer2(many=True, source="ruleapplied_set")
 
     class Meta:
         model = Specs
@@ -135,3 +136,11 @@ class ValidationProgressSerializer(serializers.ModelSerializer):
     class Meta:
         model = ValidationProgress
         fields = ["object_id", "object_name", "task_id", "progress", "status", "updated_at"]
+
+
+class ApprovalCommentSerializer(serializers.ModelSerializer):
+    created_at = serializers.DateTimeField(format="%Y-%m-%d %H:%M:%S")  # ✅ custom format
+
+    class Meta:
+        model = models.ApprovalComment
+        fields = ["id", "comment", "created_at"]

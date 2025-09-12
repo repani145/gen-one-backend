@@ -719,6 +719,7 @@ class RuleAppliedView(APIView):
             # 1️⃣ Extract source_fields from payload
             source_fields = data.get("rule_applied_data", {}).get("source", {})
             spec_id = models.DataObject.objects.get(objectName=source_fields.get("spec")).id
+            print('sourec fields.............................\n',spec_id)
 
             # 2️⃣ Find matching Specs record
             spec_obj = models.Specs.objects.filter(
@@ -952,7 +953,7 @@ def handle_validated_upload(uploaded_file, obj, object_name):
         # Update previous DB record version
         models.DataFile.objects.filter(
             data_object=obj, file_name=f"{object_name}.xlsx"
-        ).update(file_name=archive_name, version=next_version)
+        ).update(file_name=archive_name, version=next_version,status='UPLOAD SUCCESS & READY FOR VALIDATION')
 
     # ✅ Save the new file as main (objectName.xlsx)
     with open(main_file_path, "wb+") as dest:
@@ -1481,7 +1482,7 @@ from rest_framework import status
 from . import models
 from . CustomValidationFiles.common_rules_validators import run_default_validators
 from . CustomValidationFiles.custom_rule_validator import run_custom_rule_validation
-from . file_utils import get_file_path_with_object_name
+from . file_utils import get_file_path_with_object_name,get_file_paths
 import time
 from . working_file_manager import create_and_get_working_file_path,delete_working_directory
 from django.utils import timezone
@@ -1496,7 +1497,8 @@ import threading
 # Global in-memory store for progress objects
 PROGRESS_STORE = {}
 
-def create_progress(task_name: str):
+# //////1:52
+def create_progress(task_name: str, data_object):
     task_id = str(uuid.uuid4())
     progress_obj = {
         "id": task_id,
@@ -1507,21 +1509,48 @@ def create_progress(task_name: str):
         "updated_at": datetime.now().isoformat()
     }
     PROGRESS_STORE[task_id] = progress_obj
+
+    # Create DB record
+    models.ValidationProgress.objects.create(
+        data_object=data_object,
+        task_id=task_id,
+        progress=0,
+        status="pending"
+    )
+
     print(f"[PROGRESS] Created tracker: {task_id} for task: {task_name}")
     return task_id, progress_obj
 
+# 2:19
 def update_progress(task_id: str, progress: int, message: str = ""):
+    # Update memory
     if task_id in PROGRESS_STORE:
         PROGRESS_STORE[task_id]["progress"] = progress
         if message:
             PROGRESS_STORE[task_id]["message"] = message
         PROGRESS_STORE[task_id]["updated_at"] = datetime.now().isoformat()
-        print(f"[PROGRESS] {task_id} -> {progress}% | {message}")
+
+    # Update DB
+    try:
+        vp = models.ValidationProgress.objects.get(task_id=task_id)
+        vp.progress = progress
+        if progress >= 100:
+            vp.status = "completed"
+        elif progress == 0 and "Error" in message:
+            vp.status = "failed"
+        else:
+            vp.status = "running"
+        vp.save(update_fields=["progress", "status", "updated_at"])
+    except models.ValidationProgress.DoesNotExist:
+        print(f"[DB WARNING] No ValidationProgress found for task {task_id}")
+
+    print(f"[PROGRESS] {task_id} -> {progress}% | {message}")
+
 
 def get_progress(task_id: str):
     return PROGRESS_STORE.get(task_id, {"progress": 0, "message": ""})
 
-
+# 8:23 /////
 def run_validation_in_background(task_id, data_object_id, request_data):
     """All heavy validation logic moved here."""
     try:
@@ -1561,7 +1590,7 @@ def run_validation_in_background(task_id, data_object_id, request_data):
                 missing_files.append(dep_name)
                 print(f"[Thread] Missing dependency: {dep_name}")
         if missing_files:
-            update_progress(task_id, 20, f"Missing dependencies: {', '.join(missing_files)}")
+            update_progress(task_id, 9, f"Missing dependencies: {', '.join(missing_files)}")
             print(f"[Thread ERROR] Missing dependencies: {', '.join(missing_files)}")
             return
 
@@ -1574,21 +1603,21 @@ def run_validation_in_background(task_id, data_object_id, request_data):
         print(f"[Thread] Working paths: {paths}")
         resultLog1 = run_default_validators(
             file_path=paths.get('working_file_path'),
-            log_file_path=paths.get('log_file_path'),
+            log_file_path=paths.get('working_log_file_path'),
             primary_field=request_data.get("fieldId"),
             task_id=task_id,
             update_progress_fun=update_progress
         )
         update_progress(task_id, 65, "default Validation completed successfully")
-        delete_working_directory(paths.get('working_file_path'))
+        # delete_working_directory(paths.get('working_file_path'))
         print("[Thread] Deleted working directory")
 
         # Prepare logs
         update_progress(task_id, 68, "Processing logs")
         source_file = get_file_path_with_object_name(data_object.objectName)
-        log_file_path = paths.get('log_file_path')
+        working_log_file_path = paths.get('working_log_file_path')
         try:
-            with open(log_file_path, "rb") as f:
+            with open(working_log_file_path, "rb") as f:
                 existing_log = pd.read_excel(f)
             print(f"[Thread] Existing log loaded. Rows: {len(existing_log)}")
         except FileNotFoundError:
@@ -1634,17 +1663,35 @@ def run_validation_in_background(task_id, data_object_id, request_data):
         else:
             final_log = existing_log
 
-        with pd.ExcelWriter(log_file_path, engine="openpyxl", mode="w") as writer:
+        with pd.ExcelWriter(working_log_file_path, engine="openpyxl", mode="w") as writer:
             final_log.to_excel(writer, index=False)
 
+        actual_log_file_path = os.path.join(paths.get('logging_dir'), paths.get("log_file_name"))
+
+        # Copy working log file to actual log file
+        with pd.ExcelFile(working_log_file_path) as xls:
+            with pd.ExcelWriter(actual_log_file_path, engine="openpyxl") as writer:
+                # Copy existing sheets
+                for sheet in xls.sheet_names:
+                    df = xls.parse(sheet)
+                    df.to_excel(writer, sheet_name=sheet, index=False)
+
+        delete_working_directory(paths.get('working_file_path'))
         update_progress(task_id, 98, "written in log file successfully !")
         print("[Thread] Final log written to Excel")
 
         # Update DataFile validation status
         data_file = models.DataFile.objects.filter(data_object=data_object, version=0).first()
         if data_file:
-            data_file.validation = 1
+            if not final_log.empty:
+                # data_file.validation = models.DataFile.ValidationStatus.FAILED
+                data_file.status = "VALIDATION FAILED"
+            else:
+                # data_file.validation = models.DataFile.ValidationStatus.VALIDATED
+                data_file.status = "VALIDATED SUCCESSFULLY"
+
             data_file.validated_at = timezone.now()
+            data_file.validation = 1
             data_file.save()
             print("[Thread] DataFile validation updated")
 
@@ -1656,16 +1703,50 @@ def run_validation_in_background(task_id, data_object_id, request_data):
         print(f"[Thread ERROR] {str(e)}")
 
 
+
+# 1:54///
+from django.db import transaction
+
+# 8:34///
 class PreValidationCheckAndValidationView(APIView):
     authentication_classes = [JWTAuthentication]
     permission_classes = [IsAuthenticated]
 
     def post(self, request, data_object_id):
         print(f"\n[API] Validation API called with data_object_id: {data_object_id}")
-        # Create progress tracker
-        task_id, tracker = create_progress(f"Validation-{data_object_id}")
 
-        # Start background thread
+        # 🔹 Step 1: Check if this object already has a running validation
+        existing_in_progress = models.ValidationProgress.objects.filter(
+        data_object_id=data_object_id, 
+        status__in=["pending", "running"]
+        ).exists()
+
+        if existing_in_progress:
+            return Response({
+                "success": 0,
+                "message": "Validation is already in progress for this DataObject. Please wait until it finishes."
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        task_id = str(uuid.uuid4())  # or uuid if you prefer
+
+        # 🔹 Step 2: Create new progress tracker in DB
+        progress = models.ValidationProgress.objects.create(
+                data_object_id=data_object_id,
+                task_id=task_id,   # store it in DB
+                progress=0,
+                status="pending"
+            )
+
+        
+        PROGRESS_STORE[task_id] = {
+            "progress": 0,
+            "status": "pending",
+            "message": "Started",
+            "updated_at": datetime.now().isoformat(),
+            "source": "db"
+        }
+
+        # 🔹 Step 3: Start background thread
         thread = threading.Thread(
             target=run_validation_in_background,
             args=(task_id, data_object_id, request.data),
@@ -1673,21 +1754,39 @@ class PreValidationCheckAndValidationView(APIView):
         )
         thread.start()
 
-        # Return immediately with task_id
+        # 🔹 Step 4: Return task_id immediately
         return Response({
             "success": 1,
             "message": "Validation started",
             "data": {"task_id": task_id}
         }, status=status.HTTP_200_OK)
 
-
+# 1:56 /////
 class ValidationProgressView(APIView):
     authentication_classes = [JWTAuthentication]
     permission_classes = [IsAuthenticated]
 
     def get(self, request, task_id):
-        progress = PROGRESS_STORE.get(task_id, {"progress": 0, "message": "Task not started"})
-        return Response({"success": 1, "data": progress})
+        # First check DB
+        try:
+            vp = models.ValidationProgress.objects.get(task_id=task_id)
+            data = {
+                "task_id": vp.task_id,
+                "progress": vp.progress,
+                "status": vp.status,
+                "updated_at": vp.updated_at.isoformat(),
+                "source": "db"
+            }
+        except models.ValidationProgress.DoesNotExist:
+            # Fall back to memory store
+            data = PROGRESS_STORE.get(task_id, {
+                "task_id": task_id,
+                "progress": 0,
+                "message": "Task not found",
+                "source": "memory"
+            })
+
+        return Response({"success": 1, "data": data})
 
 
 import os
@@ -1708,9 +1807,22 @@ from rest_framework.response import Response
 from rest_framework import status
 from django.conf import settings
 
+import os
+import glob
+import pandas as pd
+from django.conf import settings
+from django.http import FileResponse
+from rest_framework.views import APIView
+from rest_framework.response import Response
+from rest_framework import status
+from rest_framework.permissions import IsAuthenticated
+from rest_framework_simplejwt.authentication import JWTAuthentication
+
+
+
 class GetLatestLogDataView(APIView):
     """
-    API to fetch top 30 rows of the latest log data for a given objectName.
+    API to fetch top 50 rows of the latest log data for a given object_name.
     If `?download=1` is passed, returns the file for download.
     """
     authentication_classes = [JWTAuthentication]
@@ -1730,40 +1842,90 @@ class GetLatestLogDataView(APIView):
                 context["message"] = f"No log directory found for {object_name}"
                 return Response(context, status=status.HTTP_404_NOT_FOUND)
 
-            # Get all log files
+            # Get all Excel log files
             log_files = glob.glob(os.path.join(log_dir, "*.xlsx"))
             if not log_files:
                 context["success"] = 0
                 context["message"] = f"No log files found for {object_name}"
                 return Response(context, status=status.HTTP_404_NOT_FOUND)
 
-            # Pick latest log file
+            # Pick the latest log file
             latest_file = max(log_files, key=os.path.getmtime)
 
             # ✅ If download flag is passed → return file
             if request.query_params.get("download") == "1":
-                return FileResponse(
-                    open(latest_file, "rb"),
+                # Use streaming file response with proper file handling
+                response = FileResponse(
+                    open(latest_file, 'rb'),
                     as_attachment=True,
-                    filename=os.path.basename(latest_file),
-                    content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    filename=os.path.basename(latest_file)
                 )
+                response['Content-Type'] = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+                response['Content-Length'] = os.path.getsize(latest_file)
+                return response
 
-            # Otherwise → return JSON response
-            with open(latest_file, "rb") as f:
-                df = pd.read_excel(f)
-
+            # ✅ Otherwise → return JSON response (top 50 rows)
+            df = pd.read_excel(latest_file)
             df = df.fillna("").head(50)
-
-            # context["file_name"] = os.path.basename(latest_file)
-            # context["total_rows"] = len(df)
             context["data"] = df.to_dict(orient="records")
 
         except Exception as e:
             context["success"] = 0
             context["message"] = str(e)
 
-        return Response(context, status=status.HTTP_200_OK if context["success"] else status.HTTP_500_INTERNAL_SERVER_ERROR)
+        return Response(
+            context,
+            status=status.HTTP_200_OK if context["success"] else status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
+
+import os
+import glob
+import shutil
+import tempfile
+from django.conf import settings
+from django.http import HttpResponse, Http404
+from rest_framework.views import APIView
+from rest_framework.permissions import IsAuthenticated
+from rest_framework_simplejwt.authentication import JWTAuthentication
+
+class DownloadLatestLogAPIView(APIView):
+    """
+    API to download the latest Excel log file for a given object_name.
+    """
+    # authentication_classes = [JWTAuthentication]
+    # permission_classes = [IsAuthenticated]
+
+    def get(self, request, object_name):
+        # Log directory path
+        log_dir = os.path.join(settings.MEDIA_ROOT, str(object_name).lower(), "Log")
+        if not os.path.exists(log_dir):
+            raise Http404(f"No log directory found for {object_name}")
+
+        # Get all Excel log files
+        log_files = glob.glob(os.path.join(log_dir, "*.xlsx"))
+        if not log_files:
+            raise Http404(f"No log files found for {object_name}")
+
+        # Pick the latest log file
+        latest_file = max(log_files, key=os.path.getmtime)
+        file_name = os.path.basename(latest_file)
+
+        # Create temporary copy
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_file_path = os.path.join(temp_dir, file_name)
+            shutil.copy2(latest_file, temp_file_path)
+
+            # Read temporary file as bytes
+            with open(temp_file_path, "rb") as f:
+                file_bytes = f.read()
+
+            # Return as download
+            response = HttpResponse(
+                file_bytes,
+                content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+            response["Content-Disposition"] = f'attachment; filename="{file_name}"'
+            return response  # temporary file is deleted automatically
 
 
 import uuid, time, threading
@@ -1805,3 +1967,718 @@ def upload_status(request, upload_id):
     return JsonResponse({"upload_id": upload_id, "progress": progress})
 
 
+
+from django.core.mail import EmailMessage
+from django.conf import settings
+from django.urls import reverse
+from rest_framework.views import APIView
+from rest_framework.response import Response
+from rest_framework import status
+from django.core.signing import TimestampSigner, BadSignature, SignatureExpired
+from django.http import HttpResponseForbidden
+from django.shortcuts import render, redirect, get_object_or_404
+import os
+import threading
+
+from . import models
+
+signer = TimestampSigner()
+
+class RequestApprovalView(APIView):
+    """
+    API endpoint to handle approval requests:
+    - approval → send approval email with attachments and dynamic link
+    - cancel_approval → cancel existing approval (set status back to waiting)
+    - cancel_progress → disable latest dynamic link (make it unusable)
+    """
+
+    def post(self, request, pk):
+        try:
+            print(f"➡️ Incoming approval request for file ID: {pk}")
+
+            file_obj = get_object_or_404(models.DataFile, pk=pk)
+            object_name = file_obj.data_object.objectName
+            print(f"✅ File found: {file_obj.file_name}, Object: {object_name}")
+
+            # Get flag from request
+            flag = request.data.get("flag")
+            print(f"📌 Flag received: {flag}")
+
+            if not flag:
+                print("❌ No flag provided in request.")
+                return Response({"success": 0, "message": "Flag is required"}, status=status.HTTP_400_BAD_REQUEST)
+
+            # ---------------------------------------------------
+            # 1. REQUESTING_FOR_APPROVAL
+            # ---------------------------------------------------
+            if flag == "approval":
+                print("➡️ Processing approval request...")
+
+                if file_obj.validation == 0:
+                    print("❌ File is not validated yet.")
+                    return Response({"success": 0, "message": "File is not validated yet"})
+
+                elif file_obj.approval_status == models.DataFile.ApprovalStatus.APPROVED or file_obj.release:
+                    print("❌ File is already approved.")
+                    return Response({"success": 0, "message": "File is already approved"})
+
+                elif file_obj.request_progress == 1:
+                    print("❌ File is already in Request Progress.")
+                    return Response({"success": 0, "message": "File is already in Request Progress"})
+
+                # Get file paths
+                print("📂 Getting file paths...")
+                data_file_path, log_file_path = get_file_paths(object_name, file_obj.file_name)
+
+                # Generate token
+                print("🔑 Generating approval token...")
+                token = signer.sign(str(file_obj.id))
+                approve_url = request.build_absolute_uri(reverse("approval-form", args=[token]))
+                print(f"🔗 Approval URL: {approve_url}")
+
+                # Send email
+                print("📧 Sending approval email...")
+                subject = f"Approval Request for Data Load {object_name} (Valid 24 hrs)"
+                body = f"""
+                    Hello Approver,
+
+                    Please find attached the data load file for {object_name} for your review and approval.
+
+                    Click the link below to approve or reject the data load:
+                    {approve_url}
+
+                    Note: This link will expire in 24 hours or once the action is taken.
+
+                    Thank you,
+                    Data Load Team
+                    """
+
+                email = EmailMessage(subject, body, settings.DEFAULT_FROM_EMAIL, ['sivakrishna.aar@gmail.com'])
+
+                if os.path.exists(data_file_path):
+                    print(f"📎 Attaching data file: {data_file_path}")
+                    email.attach_file(data_file_path)
+                if log_file_path and os.path.exists(log_file_path):
+                    print(f"📎 Attaching log file: {log_file_path}")
+                    email.attach_file(log_file_path)
+
+                email.send()
+                print("✅ Approval email sent successfully.")
+
+                # Update DB
+                file_obj.approval_token = token
+                file_obj.request_progress = 1
+                file_obj.approval_link_used = False
+                file_obj.save()
+                print("💾 File approval request state saved to DB.")
+
+                return Response({"success": 1, "message": "Approval email sent successfully."}, status=status.HTTP_200_OK)
+
+            # ---------------------------------------------------
+            # 2. REQUEST_TO_CANCEL_APPROVAL
+            # ---------------------------------------------------
+            elif flag == "cancel_approval":
+                print("➡️ Processing cancel approval request...")
+
+                if file_obj.approval_status == models.DataFile.ApprovalStatus.APPROVED:
+                    if file_obj.validation == 0:
+                        print("❌ File is not validated yet.")
+                        return Response({"success": 0, "message": "File is not validated yet"})
+
+                    elif file_obj.request_progress == 1:
+                        print("❌ File is already in Request Progress.")
+                        return Response({"success": 0, "message": "File is already in Request Progress"})
+
+                    elif not file_obj.release:
+                        print("❌ File is not in Approved Status.")
+                        return Response({"success": 0, "message": "File is not in Approved Status"})
+
+                
+
+                    # Get file paths
+                    print("📂 Getting file paths...")
+                    data_file_path, log_file_path = get_file_paths(object_name, file_obj.file_name)
+
+                    # Generate release token
+                    print("🔑 Generating release token...")
+                    token = signer.sign(str(file_obj.id))
+                    release_url = request.build_absolute_uri(reverse("approval-form", args=[token]))
+                    print(f"🔗 Release URL: {release_url}")
+
+                    # Send cancellation email
+                    print("📧 Sending cancel approval email...")
+                    subject = f"❌ Approval Cancelation Request for Data Load {object_name}"
+                    body = f"""
+                        Hello Approver,
+
+                        The approval for data load file **{object_name}** has been requested to release or cancel the Approve.
+
+                        File: {file_obj.file_name}
+                        Cancelled At: {timezone.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+                        👉 Click the link below to mark this file as **READY TO UPLOAD**:
+                        {release_url}
+
+                        Note: This link will expire in 24 hours or once the action is taken.
+
+                        Regards,  
+                        Data Load Team
+                    """
+
+                    email = EmailMessage(subject, body, settings.DEFAULT_FROM_EMAIL, ['sivakrishna.aar@gmail.com'])
+
+                    if os.path.exists(data_file_path):
+                        print(f"📎 Attaching data file: {data_file_path}")
+                        email.attach_file(data_file_path)
+                    if log_file_path and os.path.exists(log_file_path):
+                        print(f"📎 Attaching log file: {log_file_path}")
+                        email.attach_file(log_file_path)
+
+                    email.send()
+                    print("✅ Cancel approval email sent successfully.")
+
+                    # Save state
+                    file_obj.approval_token = token
+                    file_obj.request_progress = 1
+                    file_obj.approval_link_used = False
+                    file_obj.save()
+                    print("💾 Cancel approval request state saved to DB.")
+
+                    return Response({"success": 1, "message": "Approval cancel request sent with release link."}, status=status.HTTP_200_OK)
+
+                else:
+                    print("❌ File is not in approved state.")
+                    return Response({"success": 0, "message": "File is not in approved state."}, status=status.HTTP_400_BAD_REQUEST)
+
+            # ---------------------------------------------------
+            # 3. TO_CANCEL_PROGRESS
+            # ---------------------------------------------------
+            elif flag == "cancel_progress":
+                print("➡️ Cancelling approval progress...")
+                
+                file_obj.request_progress = 0
+                file_obj.approval_link_used = True
+                file_obj.approval_token = None
+                file_obj.save()
+                print("💾 Approval progress cancelled & link disabled.")
+
+                return Response({"success": 1, "message": "Approval progress cancelled and link disabled."}, status=status.HTTP_200_OK)
+
+            # ---------------------------------------------------
+            # Invalid Flag
+            # ---------------------------------------------------
+            else:
+                print("❌ Invalid flag provided.")
+                return Response({"success": 0, "message": "Invalid flag provided."}, status=status.HTTP_400_BAD_REQUEST)
+
+        except models.DataFile.DoesNotExist:
+            print("❌ File not found in DB.")
+            return Response({"success": 0, "message": "File not found."}, status=status.HTTP_404_NOT_FOUND)
+        except Exception as e:
+            print(f"💥 Exception occurred: {str(e)}")
+            return Response({"success": 0, "message": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+# 5:53
+# class RequestApprovalView(APIView):
+#     """
+#     API endpoint to handle approval requests:
+#     - REQUESTING_FOR_APPROVAL → send approval email with attachments and dynamic link
+#     - REQUEST_TO_CANCEL_APPROVAL → cancel existing approval (set status back to waiting)
+#     - TO_CANCEL_PROGRESS → disable latest dynamic link (make it unusable)
+#     """
+
+#     def post(self, request, pk):
+#         try:
+#             file_obj = get_object_or_404(models.DataFile, pk=pk)
+#             object_name = file_obj.data_object.objectName
+
+#             # Get flag from request
+#             flag = request.data.get("flag")  # e.g. REQUESTING_FOR_APPROVAL, REQUEST_TO_CANCEL_APPROVAL, TO_CANCEL_PROGRESS
+#             if not flag:
+#                 return Response({"success": 0, "message": "Flag is required"}, status=status.HTTP_400_BAD_REQUEST)
+
+#             # ---------------------------------------------------
+#             # 1. REQUESTING_FOR_APPROVAL
+#             # ---------------------------------------------------
+#             if flag == "approval":
+#                 if file_obj.validation == 0:
+#                     return Response({"success": 0, "message": "File is not validated yet"})
+
+#                 elif file_obj.approval_status==models.DataFile.ApprovalStatus.APPROVED or file_obj.release == True:
+#                     return Response({"success":0,"message":"file is already approved"})
+
+#                 elif file_obj.request_progress == 1:
+#                     return Response({"success":0,"message":"file is already in Request Progress"})
+                            
+#                 # Get file paths
+#                 data_file_path, log_file_path = get_file_paths(object_name, file_obj.file_name)
+
+#                 # Generate dynamic signed token
+#                 token = signer.sign(str(file_obj.id))
+#                 approve_url = request.build_absolute_uri(
+#                     reverse("approval-form", args=[token])
+#                 )
+
+#                 subject = f"Approval Request for Data Load {object_name} (Valid 24 hrs)"
+#                 body = f"""
+#                     Hello Approver,
+
+#                     Please find attached the data load file for {object_name} for your review and approval.
+
+#                     Click the link below to approve or reject the data load:
+#                     {approve_url}
+
+#                     Note: This link will expire in 24 hours or once the action is taken.
+
+#                     Thank you,
+#                     Data Load Team
+#                     """
+
+#                 email = EmailMessage(
+#                     subject,
+#                     body,
+#                     settings.DEFAULT_FROM_EMAIL,
+#                     ['sivakrishna.aar@gmail.com'],
+#                 )
+
+#                 # Attach files
+#                 if os.path.exists(data_file_path):
+#                     email.attach_file(data_file_path)
+#                 if log_file_path and os.path.exists(log_file_path):
+#                     email.attach_file(log_file_path)
+
+#                 email.send()
+
+#                 # Update file approval status
+#                 # file_obj.approval_status = models.DataFile.ApprovalStatus.WAITING
+#                 # file_obj.approval_link_used = False
+#                 file_obj.approval_token = token   # ✅ Save token in DB
+#                 file_obj.request_progress = 1     # ✅ Progress started
+#                 file_obj.save()
+
+#                 return Response({"success": 1, "message": "Approval email sent successfully."}, status=status.HTTP_200_OK)
+
+#             # ---------------------------------------------------
+#             # 2. REQUEST_TO_CANCEL_APPROVAL
+#             # ---------------------------------------------------
+#             elif flag == "cancel_approval":
+#                 if file_obj.approval_status == models.DataFile.ApprovalStatus.APPROVED:
+#                     if file_obj.validation == 0:
+#                         return Response({"success": 0, "message": "File is not validated yet"})
+
+#                     # elif file_obj.approval_status==models.DataFile.ApprovalStatus.APPROVED:
+#                     #     return Response({"success":0,"message":"file is already approved"})
+
+#                     elif file_obj.request_progress == 1:
+#                         return Response({"success":0,"message":"file is already in Request Progress"})
+                    
+#                     elif file_obj.release == False:
+#                         return Response({"success":0,"message":"file is not in Approved Status"})
+
+#                     file_obj.save()
+
+#                     # Generate dynamic signed token for release
+#                     token = signer.sign(str(file_obj.id))
+#                     release_url = request.build_absolute_uri(
+#                         reverse("approval-form", args=[token])
+#                     )
+
+#                     # Send cancellation email with release link
+#                     subject = f"❌ Approval Cancelation Request for Data Load {object_name}"
+#                     body = f"""
+#                         Hello Approver,
+
+#                         The approval for data load file **{object_name}** has been requested to release or cancel the Approve.
+
+#                         File: {file_obj.file_name}
+#                         Cancelled At: {timezone.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+#                         👉 Click the link below to mark this file as **READY TO UPLOAD**:
+#                         {release_url}
+
+#                         Note: This link will expire in 24 hours or once the action is taken.
+
+#                         Regards,  
+#                         Data Load Team
+#                     """
+
+#                     email = EmailMessage(
+#                         subject,
+#                         body,
+#                         settings.DEFAULT_FROM_EMAIL,
+#                         ['sivakrishna.aar@gmail.com'],   # TODO: replace with dynamic approver email
+#                     )
+#                     email.send()
+
+#                     # Save token
+#                     file_obj.approval_token = token
+#                     file_obj.request_progress = 1 
+#                     file_obj.save()
+
+#                     return Response(
+#                         {"success": 1, "message": "Approval cancel request sent with release link."},
+#                         status=status.HTTP_200_OK,
+#                     )
+#                 else:
+#                     return Response(
+#                         {"success": 0, "message": "File is not in approved state."},
+#                         status=status.HTTP_400_BAD_REQUEST,
+#                     )
+
+#             # ---------------------------------------------------
+#             # 3. TO_CANCEL_PROGRESS
+#             # ---------------------------------------------------
+#             elif flag == "cancel_progress":
+#                 file_obj.request_progress = 0
+#                 file_obj.approval_link_used = True   # disable link
+#                 file_obj.approval_token = None       # clear token
+#                 file_obj.save()
+#                 return Response({"success": 1, "message": "Approval progress cancelled and link disabled."}, status=status.HTTP_200_OK)
+
+#             # ---------------------------------------------------
+#             # Invalid Flag
+#             # ---------------------------------------------------
+#             else:
+#                 return Response({"success": 0, "message": "Invalid flag provided."}, status=status.HTTP_400_BAD_REQUEST)
+
+#         except models.DataFile.DoesNotExist:
+#             return Response({"success": 0, "message": "File not found."}, status=status.HTTP_404_NOT_FOUND)
+#         except Exception as e:
+#             return Response({"success": 0, "message": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+# class RequestApprovalView(APIView):
+#     """
+#     API endpoint to send approval email with attachments and dynamic link
+#     """
+
+#     def post(self, request, pk):
+#         try:
+#             file_obj = get_object_or_404(models.DataFile, pk=pk)
+#             object_name = file_obj.data_object.objectName
+
+#             # Check if validated
+#             if file_obj.validation == 0:
+#                 return Response({"success": 0, "message": "File is not validated yet"})
+
+#             # Get file paths
+#             data_file_path, log_file_path = get_file_paths(object_name, file_obj.file_name)
+
+#             # Generate dynamic signed token
+#             token = signer.sign(str(file_obj.id))  
+#             approve_url = request.build_absolute_uri(
+#                 reverse("approval-form", args=[token])
+#             )
+
+#             subject = f"Approval Request for Data Load {object_name} (Valid 24 hrs)"
+#             body = f"""
+#                 Hello Approver,
+
+#                 Please find attached the data load file for {object_name} for your review and approval.
+
+#                 Click the link below to approve or reject the data load:
+#                 {approve_url}
+
+#                 Note: This link will expire in 24 hours or once the action is taken.
+
+#                 Thank you,
+#                 Data Load Team
+#                 """
+
+#             email = EmailMessage(
+#                 subject,
+#                 body,
+#                 settings.DEFAULT_FROM_EMAIL,
+#                 ['sivakrishna.aar@gmail.com'],
+#             )
+
+#             # Attach files
+#             if os.path.exists(data_file_path):
+#                 email.attach_file(data_file_path)
+#             if log_file_path and os.path.exists(log_file_path):
+#                 email.attach_file(log_file_path)
+
+#             email.send()
+
+#             # Update file approval status
+#             # file_obj.approval_status = models.DataFile.ApprovalStatus.WAITING
+#             file_obj.approval_link_used = False
+#             file_obj.approval_token = token   # ✅ Save token in DB
+#             file_obj.request_progress = 1     # ✅ Progress started
+#             file_obj.save()
+
+#             return Response(
+#                 {"success": 1, "message": "Approval email sent successfully."},
+#                 status=status.HTTP_200_OK,
+#             )
+
+#         except models.DataFile.DoesNotExist:
+#             return Response({"success": 0, "message": "File not found."}, status=status.HTTP_404_NOT_FOUND)
+#         except Exception as e:
+#             return Response({"success": 0, "message": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+# class RequestApprovalView(APIView):
+#     """
+#     API endpoint to send approval email with attachments and dynamic link
+#     """
+
+#     def post(self, request, pk):
+#         try:
+#             file_obj = get_object_or_404(models.DataFile, pk=pk)
+#             object_name = file_obj.data_object.objectName
+
+#             # check weather file is validated or not
+#             print('file validation status is ',file_obj.validation)
+#             if file_obj.validation == 0:
+#                 return Response({"success": 0, "message": "file is not validated yet"})
+                
+#             # Get file paths
+#             data_file_path, log_file_path = get_file_paths(object_name, file_obj.file_name)
+
+#             # Generate dynamic signed token
+#             token = signer.sign(str(file_obj.id))  # timestamped
+#             approve_url = request.build_absolute_uri(
+#                 reverse("approval-form", args=[token])
+#             )
+
+#             subject = f"Approval Request for Data Load {object_name} (Valid 24 hrs)"
+#             body = f"""
+#                 Hello Approver,
+
+#                 Please find attached the data load file for {object_name} for your review and approval.
+
+#                 Click the link below to approve or reject the data load:
+#                 {approve_url}
+
+#                 Note: This link will expire in 24 hours or once the action is taken.
+
+#                 Thank you,
+#                 Data Load Team
+#                 """
+
+#             email = EmailMessage(
+#                 subject,
+#                 body,
+#                 settings.DEFAULT_FROM_EMAIL,
+#                 ['sivakrishna.aar@gmail.com'],
+#             )
+
+#             # Attach files
+#             if os.path.exists(data_file_path):
+#                 email.attach_file(data_file_path)
+#             if log_file_path and os.path.exists(log_file_path):
+#                 email.attach_file(log_file_path)
+
+#             email.send()
+
+#             # Update file approval status
+#             # file_obj.approval_status = 0  # WAITING FOR APPROVAL
+#             if not file_obj.approval_status:
+#                 file_obj.approval_status=0
+#             file_obj.approval_link_used = False   # ✅ allow new link usage
+#             file_obj.save()
+
+#             return Response({"success": 1, "message": "Approval email sent successfully."}, status=status.HTTP_200_OK)
+
+#         except models.DataFile.DoesNotExist:
+#             return Response({"success": 0, "message": "File not found."}, status=status.HTTP_404_NOT_FOUND)
+#         except Exception as e:
+#             return Response({"success": 0, "message": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+from django.shortcuts import render, redirect
+from django.http import HttpResponseForbidden
+from django.utils import timezone
+from django.core.signing import BadSignature, SignatureExpired
+
+from .models import DataFile, ApprovalComment
+
+def approval_form(request, token):
+    try:
+        file_id = signer.unsign(token, max_age=86400)  # 24hr expiry
+        file_obj = DataFile.objects.get(pk=file_id)
+    except SignatureExpired:
+        return HttpResponseForbidden("⏳ This approval link has expired (time-based).")
+    except BadSignature:
+        return HttpResponseForbidden("❌ Invalid approval link.")
+
+    # 🔹 Check if this token matches the latest one saved
+    if file_obj.approval_token != token:
+        return HttpResponseForbidden("⚠️ This approval link is no longer valid (a newer link was issued).")
+
+    # 🔹 Check if link was already used once
+    if file_obj.approval_link_used:
+        return HttpResponseForbidden("⚠️ This approval link has already been used.")
+
+    if request.method == "POST":
+        action = request.POST.get("action")
+        comment_text = request.POST.get("comment", "").strip()
+
+        # --- CASE 1: Initial approval (status = 0)
+        if file_obj.approval_status == 0:
+            if action == "approve":
+                file_obj.approval_status = 1
+                file_obj.release = True
+            elif action == "reject":
+                file_obj.approval_status = 2
+
+        # --- CASE 2: Cancel approval (status = 1)
+        elif file_obj.approval_status == 1:
+            if action == "approve":
+                file_obj.approval_status = 0
+                file_obj.release = False
+            elif action == "reject":
+                file_obj.approval_status = 1
+
+        # --- CASE 3: Rejected file
+        elif file_obj.approval_status == 2:
+            if action == "approve":
+                file_obj.approval_status = 1
+                file_obj.release = True
+            elif action == "reject":
+                file_obj.approval_status = 2
+
+        # Save main DataFile state
+        file_obj.approval_link_used = True   # 🔹 Mark link as used
+        file_obj.request_progress = 0
+        file_obj.approval_token = ''         # 🔹 Clear token after use
+        file_obj.approved_at = timezone.now()
+
+        if comment_text:
+            file_obj.approver_comment = comment_text  # keep latest comment for quick view
+        file_obj.save()
+
+        # 🔹 Always save comment in separate table
+        if comment_text:
+            ApprovalComment.objects.create(
+                data_file=file_obj,
+                comment=comment_text,
+            )
+
+        return redirect("approval-success")
+
+    return render(request, "approval_form.html", {"file": file_obj})
+
+
+# def approval_form(request, token):
+#     try:
+#         file_id = signer.unsign(token, max_age=86400)  # 24hr expiry
+#         file_obj = DataFile.objects.get(pk=file_id)
+#     except SignatureExpired:
+#         return HttpResponseForbidden("⏳ This approval link has expired (time-based).")
+#     except BadSignature:
+#         return HttpResponseForbidden("❌ Invalid approval link.")
+
+#     # 🔹 Check if link was already used once
+#     if file_obj.approval_link_used:
+#         return HttpResponseForbidden("⚠️ This approval link has already been used.")
+
+#     if request.method == "POST":
+#         action = request.POST.get("action")
+#         comment_text = request.POST.get("comment", "").strip()
+
+#          # --- CASE 1: Initial approval (status = 0)
+#         if file_obj.approval_status == 0:
+#             if action == "approve":
+#                 file_obj.approval_status = 1
+#                 file_obj.release=True
+#             elif action == "reject":
+#                 file_obj.approval_status = 2
+
+#         # --- CASE 2: Cancel approval (status = 1)
+#         elif file_obj.approval_status == 1:
+#             if action == "approve":
+#                 file_obj.approval_status = 0
+#                 file_obj.release=False
+#             elif action == "reject":
+#                 file_obj.approval_status = 1
+
+#         # --- CASE 3: Rejected file
+#         elif file_obj.approval_status == 2:
+#             if action == "approve":
+#                 file_obj.approval_status = 1
+#                 file_obj.release = True
+#             elif action == "reject":
+#                 file_obj.approval_status = 2
+
+
+#         # Save main DataFile state
+#         file_obj.approval_link_used = True   # 🔹 Mark link as used
+#         file_obj.request_progress = 0
+#         file_obj.approval_token = ''
+#         file_obj.approved_at = timezone.now()
+        
+#         if comment_text:  
+#             file_obj.approver_comment = comment_text  # keep latest comment for quick view
+#         file_obj.save()
+
+#         # 🔹 Always save comment in separate table
+#         if comment_text:
+#             ApprovalComment.objects.create(
+#                 data_file=file_obj,
+#                 comment=comment_text,
+#             )
+
+#         return redirect("approval-success")
+
+#     return render(request, "approval_form.html", {"file": file_obj})
+
+
+def approval_success_view(request):
+    return render(request, "approval_success.html")
+
+
+
+# from rest_framework.views import APIView
+# from rest_framework.response import Response
+# from rest_framework import status
+# from django.shortcuts import get_object_or_404
+# from .models import DataFile, ApprovalComment
+# from .serializers import ApprovalCommentSerializer
+
+from rest_framework.views import APIView
+from rest_framework.response import Response
+from rest_framework import status
+from .models import DataFile, ApprovalComment
+
+class DataObjectCommentsView(APIView):
+    """
+    API to fetch all comments for a given data_object_id
+    """
+
+    def get(self, request, data_object_id):
+        try:
+            # 🔹 Get all files under this data_object
+            files = models.DataFile.objects.filter(data_object_id=data_object_id)
+            if not files.exists():
+                return Response(
+                    {"success": 0, "message": "No files found for this data object."},
+                    status=status.HTTP_404_NOT_FOUND,
+                )
+
+            # 🔹 Fetch all comments related to these files
+            comments = models.ApprovalComment.objects.filter(data_file__in=files).order_by("-created_at")
+
+            data = [
+                {
+                    "id": c.id,
+                    "file_id": c.data_file.id,
+                    "file_name": c.data_file.file_name,
+                    "comment": c.comment,
+                    "created_at": c.created_at.strftime("%Y-%m-%d %H:%M:%S"),
+                }
+                for c in comments
+            ]
+
+            return Response(
+                {"success": 1, "data": data},
+                status=status.HTTP_200_OK,
+            )
+
+        except Exception as e:
+            return Response(
+                {"success": 0, "message": str(e)},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )

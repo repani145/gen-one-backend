@@ -5,6 +5,7 @@ import pandas as pd
 from django.conf import settings
 from . import models
 from django.utils.timezone import now
+from time import time
 
 # def create_and_get_working_file_path(object_id):
 #     """
@@ -100,6 +101,10 @@ def create_and_get_working_file_path(object_id, retries=3, delay=1):
 
     # Define new working file path
     working_file_path = os.path.join(working_dir, f"{object_name}_working.xlsx")
+    working_log_file_path = os.path.join(working_dir, f"{object_name}_working_log.xlsx")
+
+    with pd.ExcelWriter(working_log_file_path, engine="openpyxl") as writer:
+        pd.DataFrame(columns=["primary_field", "rule_data", "time"]).to_excel(writer, index=False)
 
     # Retry loop in case of Windows file lock
     for attempt in range(retries):
@@ -140,14 +145,14 @@ def create_and_get_working_file_path(object_id, retries=3, delay=1):
     # Build file name with timestamp (for log file)
     timestamp = now().strftime("%Y%m%d_%H%M%S")
     log_file_name = f"{object_name}_Log_{timestamp}.xlsx"
-    log_file_path = os.path.join(logging_dir, log_file_name)
+    # log_file_path = os.path.join(logging_dir, log_file_name)
 
     # Create an empty DataFrame with required log structure
     # pd.DataFrame(columns=["primary_field", "rule_data", "time"]).to_excel(log_file_path, index=False)
-    with pd.ExcelWriter(log_file_path, engine="openpyxl") as writer:
-        pd.DataFrame(columns=["primary_field", "rule_data", "time"]).to_excel(writer, index=False)
+    # with pd.ExcelWriter(log_file_path, engine="openpyxl") as writer:
+    #     pd.DataFrame(columns=["primary_field", "rule_data", "time"]).to_excel(writer, index=False)
 
-    return {'working_file_path':working_file_path,'log_file_path':log_file_path}
+    return {'working_file_path':working_file_path,'working_log_file_path':working_log_file_path,"logging_dir":logging_dir,"log_file_name":log_file_name}
 
 
 def delete_working_directory(working_file_path):

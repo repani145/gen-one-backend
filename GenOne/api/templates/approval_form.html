@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Approval Form</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+
+<body class="bg-gray-100 flex items-center justify-center min-h-screen">
+
+  <div class="bg-white rounded-2xl shadow-lg p-8 w-full max-w-md">
+    <!-- Header -->
+    <h2 class="text-2xl font-bold text-gray-800 mb-6 text-center">
+      {% if file.approval_status == 0 %}
+      Approval Form
+      {% elif file.approval_status == 1 %}
+      Cancel Approval Form
+      {% else %}
+      Approval Form
+      {% endif %}
+    </h2>
+
+    <!-- File Info -->
+    <div class="mb-6">
+      <p class="text-gray-700">
+        <span class="font-semibold">File Name:</span> {{ file.file_name }}
+      </p>
+    </div>
+
+    <!-- Form -->
+    <form method="POST" class="space-y-4">
+      {% csrf_token %}
+
+      <!-- Comment -->
+      <div>
+        <label class="block text-sm font-semibold text-gray-700 mb-1">Comment</label>
+        <textarea name="comment" rows="3"
+          class="w-full border border-gray-300 rounded-md p-2 focus:ring-2 focus:ring-blue-500 focus:outline-none resize-none"></textarea>
+      </div>
+
+      <!-- Action Buttons -->
+      <div class="flex gap-3 justify-between pt-2">
+        {% if file.approval_status == 0 %}
+        <!-- Initial approval request -->
+        <button type="submit" name="action" value="approve"
+          class="flex-1 bg-green-600 hover:bg-green-700 text-white py-2 rounded-md font-semibold transition">
+          ✅ Approve
+        </button>
+        <button type="submit" name="action" value="reject"
+          class="flex-1 bg-red-600 hover:bg-red-700 text-white py-2 rounded-md font-semibold transition">
+          ❌ Reject
+        </button>
+
+        {% elif file.approval_status == 1 %}
+        <!-- Cancel approval request -->
+        <button type="submit" name="action" value="approve"
+          class="flex-1 bg-yellow-500 hover:bg-yellow-600 text-white py-2 rounded-md font-semibold transition">
+          ↩️ Revert Approval
+        </button>
+        <button type="submit" name="action" value="reject"
+          class="flex-1 bg-gray-600 hover:bg-gray-700 text-white py-2 rounded-md font-semibold transition">
+          🚫 Reject Cancel
+        </button>
+        {% endif %}
+      </div>
+    </form>
+  </div>
+
+</body>
+
+</html>

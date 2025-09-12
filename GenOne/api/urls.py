@@ -49,6 +49,7 @@ urlpatterns = [
     path("pre_validation_check/<int:data_object_id>/", views.PreValidationCheckAndValidationView.as_view(), name="file-versions"),
 
     path("logs-view/<str:object_name>/", views.GetLatestLogDataView.as_view(), name="view-latest-log"),
+    path('download-log/<str:object_name>/',views.DownloadLatestLogAPIView.as_view(),name='download-log'),
 
     path("upload-status/<str:upload_id>/", views.UploadStatusView.as_view(), name="upload_status"),
 
@@ -58,8 +59,15 @@ urlpatterns = [
     # GET /api/spec_with_rules/5/?tab=General
     # path("validation-progress/<int:object_id>/", views.ValidationProgressView.as_view(), name="validation-progress"),
 
-     # Get current validation progress for a DataObject
+    # Get current validation progress for a DataObject
     # path("validation/progress/<int:object_id>/",views.ValidationProgressView.as_view(), name="validation-progress"),
+    path('datafiles/<int:pk>/request-approval/',views.RequestApprovalView.as_view(),name='request-approval'),
+    
+    path("approval/<str:token>/", views.approval_form, name="approval-form"),
+    path('approval-success/', views.approval_success_view, name='approval-success'),
+
+    #  path("datafiles/<int:data_file_id>/comments/", views.ApprovalCommentListView.as_view(), name="approval-comments"),
+    path("dataobjects/<int:data_object_id>/comments/", views.DataObjectCommentsView.as_view(), name="dataobject-comments"),
 ]
 
 

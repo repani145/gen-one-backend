@@ -195,3 +195,27 @@ MEDIA_ROOT = 'FileData/'
 TIME_ZONE = "Asia/Kolkata"   # IST
 USE_TZ = False                # keep timezone-aware datetimes
 
+
+
+EMAIL_BACKEND = "django.core.mail.backends.smtp.EmailBackend"
+EMAIL_HOST = "smtp.gmail.com"
+EMAIL_PORT = 587
+EMAIL_USE_TLS = True
+EMAIL_HOST_USER = "genone.tekki@gmail.com"
+EMAIL_HOST_PASSWORD = "eoxt uljv lnjm yntb"  # use app password, not Gmail password
+DEFAULT_FROM_EMAIL = EMAIL_HOST_USER
+
+
+# TEMPLATES = [
+#     {
+#         'BACKEND': 'django.template.backends.django.DjangoTemplates',
+#         'DIRS': [BASE_DIR / "GenOne/templates"],  # <-- make sure this includes your templates folder
+#         'APP_DIRS': True,
+#         'OPTIONS': {
+#             'context_processors': [
+#                 'django.template.context_processors.debug',
+#                 ...
+#             ],
+#         },
+#     },
+# ]
