@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# Virtual environment
+env/
+venv/
+.venv/
+GenOneBackendEnv/   # your custom venv folder
+*.egg-info/
+
+# Django stuff
+*.log
+*.pot
+*.pyc
+db.sqlite3
+media/
+staticfiles/
+static/
+local_settings.py
+
+# VS Code / IDE
+.vscode/
+.idea/
+
+# Environment variables
+.env
+.env.*
+*.env
+
+# OS specific
+.DS_Store
+Thumbs.db

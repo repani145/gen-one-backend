@@ -127,6 +127,9 @@ class DataFile(models.Model):
     # 🔹 Store the latest generated approval token
     approval_token = models.CharField(max_length=255, blank=True, null=True)
 
+    # data load status
+    data_load = models.IntegerField(default=0)
+
     def delete(self, *args, **kwargs):
         if self.field_mappings.exists():   # 👈 check child relationship
             raise ValidationError("Cannot delete this DataObject because related Specs exist.")
@@ -137,15 +140,23 @@ class DataFile(models.Model):
 
 
 class ApprovalComment(models.Model):
-    """
-    Separate table for comments with timestamps
-    """
+    class Action(models.TextChoices):
+        REQUEST = "request_approval", "Request Approval"
+        CANCEL = "cancel_approval", "Cancel Approval"
+
+    class ActionStatus(models.TextChoices):
+        APPROVED = "approved", "Approved"
+        REJECTED = "rejected", "Rejected"
+
     data_file = models.ForeignKey(DataFile, on_delete=models.CASCADE, related_name="comments")
-    comment = models.TextField()
+    action = models.CharField(max_length=50, choices=Action.choices)
+    action_status = models.CharField(max_length=50, choices=ActionStatus.choices)
+    comment = models.TextField(blank=True, null=True)
     created_at = models.DateTimeField(default=timezone.now)
 
     def __str__(self):
-        return f"Comment on {self.data_file.file_name} at {self.created_at}"
+        return f"[{self.action}/{self.action_status}] on {self.data_file.file_name} at {self.created_at}"
+
 
 class DeletedFileRecord(models.Model):
     data_file = models.ForeignKey("DataFile", on_delete=models.CASCADE, related_name="deleted_files")
@@ -169,10 +180,18 @@ class ValidationProgress(models.Model):
     progress = models.IntegerField(default=0)  # 0 → 100
     status = models.CharField(
         max_length=50,
-        choices=[("pending", "Pending"), ("running", "Running"), ("completed", "Completed"), ("failed", "Failed")],
+        choices=[
+            ("pending", "Pending"),
+            ("running", "Running"),
+            ("completed", "Completed"),
+            ("failed", "Failed")
+        ],
         default="pending",
     )
+    success = models.BooleanField(default=True)  # ✅ added field
+
     updated_at = models.DateTimeField(auto_now=True)
 
     def __str__(self):
         return f"{self.data_object.objectName} - {self.progress}%"
+

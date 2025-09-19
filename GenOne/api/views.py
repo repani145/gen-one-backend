@@ -1,37 +1,118 @@
-
-# views.py
+# Python standard libraries
 import os
 import io
+import glob
 import shutil
-import pandas as pd
-import django_filters
+import tempfile
+import threading
+import time
+import uuid
+from datetime import datetime
 from collections import defaultdict
 
-from django.conf import settings
-from django.db import IntegrityError
-from django.db.models import Q
-from django.core.exceptions import ObjectDoesNotExist
-from django.shortcuts import get_object_or_404
-from django.http import HttpResponse, JsonResponse
+# Third-party libraries
+import pandas as pd
+from openpyxl import Workbook
+from openpyxl.worksheet.datavalidation import DataValidation
+import django_filters
 
+# Django core
+from django.conf import settings
+from django.db import IntegrityError,transaction
+from django.db.models import Q, Max, Exists, OuterRef
+from django.core.exceptions import ObjectDoesNotExist
+from django.core.mail import EmailMessage
+from django.core.signing import TimestampSigner, BadSignature, SignatureExpired
+from django.http import (
+    HttpResponse,
+    JsonResponse,
+    FileResponse,
+    HttpResponseForbidden,
+    Http404,
+)
+from django.shortcuts import get_object_or_404, render, redirect
+from django.urls import reverse
+from django.utils import timezone
+from django.views.decorators.csrf import csrf_exempt
+
+# Django REST framework
 from rest_framework import status, generics, viewsets, filters
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.decorators import action
-
 from rest_framework_simplejwt.authentication import JWTAuthentication
+from .pagination import StandardResultsSetPagination
+from rest_framework.exceptions import PermissionDenied
 
-from openpyxl import Workbook
-from openpyxl.worksheet.datavalidation import DataValidation
 
+# Local imports
 from . import models, serializers, messages, validators, constants
 from .exceptions import SerializerError
-from .models import DataObject, DataFile, Specs
-from .serializers import FileUploadSerializer
-from .pagination import StandardResultsSetPagination
+from .models import DataObject, DataFile, Specs, ApprovalComment
+from .serializers import (
+    FileUploadSerializer,
+    DataObjectSerializer,
+    SpecsSerializer,
+    DataFileSerializer,
+)
+from .permissions import DataObjectWriteLockPermission
+from .file_utils import (
+    get_file_path_with_object_name,
+    get_file_paths,
+    get_target_specs,
+)
+from .working_file_manager import (
+    create_and_get_working_file_path,
+    delete_working_directory,
+)
+from .CustomValidationFiles.common_rules_validators import run_default_validators
+from .CustomValidationFiles.custom_rule_validator import run_custom_rule_validation
+
+import tempfile
+from django.core.files import File
+import uuid, threading, time
+from django.core.files.base import File
+from rest_framework.views import APIView
+from rest_framework.response import Response
+from rest_framework import status
+import pandas as pd, tempfile
+from .models import DataObject, Specs
+
+import pandas as pd
+import openpyxl
+import io
+from django.core.files.uploadedfile import InMemoryUploadedFile
+from sqlalchemy import inspect
+import pymysql
+from math import isfinite
 
 
+import os
+from decouple import config
+
+SAP_DB_USER = config("SAP_DB_USER")
+SAP_DB_PASS = config("SAP_DB_PASSWORD")
+SAP_DB_HOST = config("SAP_DB_HOST")
+SAP_DB_PORT = config("SAP_DB_PORT")
+SAP_SAP_DB_NAME = config("SAP_DB_NAME")
+
+
+
+class DataObjectViewSet(viewsets.ModelViewSet):
+    queryset = DataObject.objects.all()
+    serializer_class = DataObjectSerializer
+    permission_classes = [IsAuthenticated, DataObjectWriteLockPermission]
+
+class SpecsViewSet(viewsets.ModelViewSet):
+    queryset = Specs.objects.all()
+    serializer_class = SpecsSerializer
+    permission_classes = [IsAuthenticated, DataObjectWriteLockPermission]
+
+class DataFileViewSet(viewsets.ModelViewSet):
+    queryset = DataFile.objects.all()
+    serializer_class = DataFileSerializer
+    permission_classes = [IsAuthenticated, DataObjectWriteLockPermission]
 
 class RuleAppliedFilter(django_filters.FilterSet):
     # create a custom alias for the long FK chain
@@ -56,7 +137,7 @@ class RuleAppliedFilter(django_filters.FilterSet):
         fields = ["objectName", "rule_applied", "created_after", "created_before"]
 
 class RuleAppliedGetView(APIView):
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated,DataObjectWriteLockPermission]
 
     def get(self, request, *args, **kwargs):
         queryset = models.RuleApplied.objects.select_related("spec").all()
@@ -82,10 +163,9 @@ class RuleAppliedGetView(APIView):
         serializer = serializers.RuleAppliedTableSerializer(paginated_qs, many=True)
         return paginator.get_paginated_response(serializer.data)
 
-
 class AllDataObjectView(APIView):
     authentication_classes = [JWTAuthentication]
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated,DataObjectWriteLockPermission]
 
     def get(self, request):
         context = {
@@ -102,175 +182,9 @@ class AllDataObjectView(APIView):
             context['message'] = str(e)
         return Response(context)
 
-class DataObjectView(APIView):
-    authentication_classes = [JWTAuthentication]
-    permission_classes = [IsAuthenticated]
-    # pagination_class = CustomPagination  # Replace with your actual pagination class if different
-
-    def get(self, request, id):
-        context = {
-            "success": 1,
-            "message": messages.DATA_FOUND,
-            "data": [],
-        }
-        try:
-            
-            record_id = id
-            print('iddddddddddddd',id)
-            # Single record fetch
-            module = models.DataObject.objects.get(id=record_id)
-            module_ser = serializers.DataObjectSerializer(module)
-            context["data"] = module_ser.data
-            context["count"] = 1
-
-        except models.DataObject.DoesNotExist:
-            context["success"] = 0
-            context["message"] = "Record not found"
-        except Exception as e:
-            context["success"] = 0
-            context["message"] = str(e)
-
-        return Response(context)
-
-    def post(self, request, *args, **kwargs):
-        context = {
-            "success": 1,
-            "message": messages.DATA_SAVED,
-            "data": {},
-        }
-        try:
-            validator = validators.ObjectDataValidator(data=request.data)
-            if not validator.is_valid():
-                raise SerializerError(validator.errors)
-
-            req_params = validator.validated_data
-            module_instance = models.DataObject(**req_params)
-            module_instance.clean()
-            module_instance.save()
-
-            context["data"] = serializers.DataObjectSerializer(module_instance).data
-
-        except IntegrityError as e:
-            context["success"] = 0
-            if "Duplicate entry" in str(e):
-                # Extract field causing error
-                err_msg = str(e)
-                duplicate_value = err_msg.split("'")[1]
-                field_name = err_msg.split("for key")[1].split("'")[1]
-                context["message"] = f"❌ '{duplicate_value}' already exists."
-            else:
-                context["message"] = "❌ Database Integrity Error."
-
-        except Exception as e:
-            context["success"] = 0
-            context["message"] = str(e)
-
-        return Response(context)
-
-    def put(self, request, id):
-        context = {
-            "success": 1,
-            "message": messages.DATA_UPDATED,
-            "data": {},
-        }
-        try:
-            data = request.data
-            record_id = id
-            if not record_id:
-                raise Exception("ID is required for update")
-            
-            validator = validators.ObjectDataValidator(data=request.data)
-            if not validator.is_valid():
-                raise SerializerError(validator.errors)
-            
-            module_obj = models.DataObject.objects.get(id=record_id)
-            for field in ["company", "dependencies", "module", "objectName"]:
-                if field in data:
-                    setattr(module_obj, field, data[field])
-            
-            # module_obj.full_clean()
-            # print(request.data,'<<<<<<<<<--------')
-            module_obj.save()
-
-            context["data"] = serializers.DataObjectSerializer(module_obj).data
-
-        except models.DataObject.DoesNotExist:
-            context["success"] = 0
-            context["message"] = "Record not found"
-        except Exception as e:
-            context["success"] = 0
-            context["message"] = str(e)
-
-        return Response(context)
-
-    def patch(self, request, *args, **kwargs):
-        context = {
-            "success": 1,
-            "message": messages.DATA_UPDATED,
-            "data": {},
-        }
-        try:
-            data = request.data
-            record_id = data.get("id")
-            if not record_id:
-                raise Exception("ID is required for partial update")
-
-            module_obj = models.DataObject.objects.get(id=record_id)
-
-            for field in ["company", "dependencies", "module", "objectName"]:
-                if field in data:
-                    setattr(module_obj, field, data[field])
-
-            module_obj.full_clean()
-            module_obj.save()
-
-            context["data"] = serializers.DataObjectSerializer(module_obj).data
-
-        except models.DataObject.DoesNotExist:
-            context["success"] = 0
-            context["message"] = "Record not found"
-        except Exception as e:
-            context["success"] = 0
-            context["message"] = str(e)
-
-        return Response(context)
-
-    def delete(self, request, id):
-        context = {
-            "success": 1,
-            "message": messages.DATA_DELETED,
-            "data": {},
-        }
-        try:
-            if not id:
-                raise Exception("ID is required for delete")
-
-            module_obj = models.DataObject.objects.get(id=id)
-
-            # 🔍 Check if this object is a dependency in other objects
-            dependent_objects = models.DataObject.objects.filter(dependencies__contains=[module_obj.objectName])
-
-            if dependent_objects.exists():
-                raise Exception(
-                    f"Cannot delete '{module_obj.objectName}' because it is a dependency of other objects."
-                )
-
-            module_obj.delete()
-
-        except models.DataObject.DoesNotExist:
-            context["success"] = 0
-            context["message"] = "Record not found"
-        except Exception as e:
-            context["success"] = 0
-            context["message"] = str(e)
-
-        return Response(context)
-
-
-
 class AllDependenciesView(APIView):
     authentication_classes = [JWTAuthentication]
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated,DataObjectWriteLockPermission]
 
     def get(self, request):
         context = {
@@ -293,22 +207,183 @@ class AllDependenciesView(APIView):
 
         return Response(context)
 
+class DataObjectView(APIView):
+    authentication_classes = [JWTAuthentication]
+    permission_classes = [IsAuthenticated, DataObjectWriteLockPermission]
 
+    def get(self, request, id):
+        context = {"success": 1, "message": messages.DATA_FOUND, "data": []}
+        try:
+            print("➡️ GET request for DataObject ID:", id)
 
+            module = models.DataObject.objects.get(id=id)
+
+            # ✅ Permission check
+            self.check_object_permissions(request, module)
+
+            module_ser = serializers.DataObjectSerializer(module)
+            context["data"] = module_ser.data
+            context["count"] = 1
+
+        except models.DataObject.DoesNotExist:
+            context["success"] = 0
+            context["message"] = "Record not found"
+        except Exception as e:
+            context["success"] = 0
+            context["message"] = str(e)
+
+        return Response(context)
+
+    def post(self, request, *args, **kwargs):
+        context = {"success": 1, "message": messages.DATA_SAVED, "data": {}}
+        try:
+            print("➡️ POST request with data:", request.data)
+
+            validator = validators.ObjectDataValidator(data=request.data)
+            if not validator.is_valid():
+                raise SerializerError(validator.errors)
+
+            req_params = validator.validated_data
+            module_instance = models.DataObject(**req_params)
+
+            # # ✅ Permission check (new object)
+            # self.check_object_permissions(request, module_instance)
+
+            module_instance.clean()
+            module_instance.save()
+
+            context["data"] = serializers.DataObjectSerializer(module_instance).data
+
+        except IntegrityError as e:
+            context["success"] = 0
+            if "Duplicate entry" in str(e):
+                err_msg = str(e)
+                duplicate_value = err_msg.split("'")[1]
+                field_name = err_msg.split("for key")[1].split("'")[1]
+                context["message"] = f"❌ '{duplicate_value}' already exists."
+            else:
+                context["message"] = "❌ Database Integrity Error."
+        except Exception as e:
+            context["success"] = 0
+            context["message"] = str(e)
+
+        return Response(context)
+
+    def put(self, request, id):
+        context = {"success": 1, "message": messages.DATA_UPDATED, "data": {}}
+        try:
+            print("➡️ PUT request for ID:", id, "Data:", request.data)
+
+            if not id:
+                raise Exception("ID is required for update")
+
+            validator = validators.ObjectDataValidator(data=request.data)
+            if not validator.is_valid():
+                raise SerializerError(validator.errors)
+
+            module_obj = models.DataObject.objects.get(id=id)
+
+            # ✅ Permission check
+            self.check_object_permissions(request, module_obj)
+
+            for field in ["company", "dependencies", "module", "objectName"]:
+                if field in request.data:
+                    setattr(module_obj, field, request.data[field])
+
+            module_obj.save()
+            context["data"] = serializers.DataObjectSerializer(module_obj).data
+
+        except models.DataObject.DoesNotExist:
+            context["success"] = 0
+            context["message"] = "Record not found"
+        except Exception as e:
+            context["success"] = 0
+            context["message"] = str(e)
+
+        return Response(context)
+
+    def patch(self, request, *args, **kwargs):
+        context = {"success": 1, "message": messages.DATA_UPDATED, "data": {}}
+        try:
+            record_id = request.data.get("id")
+            print("➡️ PATCH request for ID:", record_id, "Data:", request.data)
+
+            if not record_id:
+                raise Exception("ID is required for partial update")
+
+            module_obj = models.DataObject.objects.get(id=record_id)
+
+            # ✅ Permission check
+            self.check_object_permissions(request, module_obj)
+
+            for field in ["company", "dependencies", "module", "objectName"]:
+                if field in request.data:
+                    setattr(module_obj, field, request.data[field])
+
+            module_obj.full_clean()
+            module_obj.save()
+            context["data"] = serializers.DataObjectSerializer(module_obj).data
+
+        except models.DataObject.DoesNotExist:
+            context["success"] = 0
+            context["message"] = "Record not found"
+        except Exception as e:
+            context["success"] = 0
+            context["message"] = str(e)
+
+        return Response(context)
+
+    def delete(self, request, id):
+        context = {"success": 1, "message": messages.DATA_DELETED, "data": {}}
+        try:
+            print("➡️ DELETE request for ID:", id)
+
+            if not id:
+                raise Exception("ID is required for delete")
+
+            module_obj = models.DataObject.objects.get(id=id)
+
+            # ✅ Permission check
+            self.check_object_permissions(request, module_obj)
+
+            # 🔍 Check if this object is a dependency in other objects
+            dependent_objects = models.DataObject.objects.filter(
+                dependencies__contains=[module_obj.objectName]
+            )
+            if dependent_objects.exists():
+                raise Exception(
+                    f"Cannot delete '{module_obj.objectName}' because it is a dependency of other objects."
+                )
+
+            module_obj.delete()
+
+        except models.DataObject.DoesNotExist:
+            context["success"] = 0
+            context["message"] = "Record not found"
+        except Exception as e:
+            context["success"] = 0
+            context["message"] = str(e)
+
+        return Response(context)
+
+# new
 class SpecsAPIView(APIView):
     authentication_classes = [JWTAuthentication]
-    permission_classes = [IsAuthenticated]
-    
+    permission_classes = [IsAuthenticated, DataObjectWriteLockPermission]
+
     def get(self, request, *args, **kwargs):
         context = {"success": 1, "message": messages.DATA_FOUND, "data": {}}
         try:
-            object_id = kwargs.get("id")   # Get objectName_id from URL
+            object_id = kwargs.get("id")
             if not object_id:
                 context["success"] = 0
                 context["message"] = "objectName_id is required"
                 return Response(context, status=status.HTTP_400_BAD_REQUEST)
 
-            # Filter only that objectName_id and order by tab + position
+            # 🔹 Fetch object and check permission
+            data_object = get_object_or_404(models.DataObject, id=object_id)
+            self.check_object_permissions(request, data_object)
+
             specs = (
                 models.Specs.objects
                 .select_related("objectName")
@@ -319,14 +394,11 @@ class SpecsAPIView(APIView):
             if not specs.exists():
                 context["success"] = 1
                 context["message"] = "No specs data exists"
-                context["data"] = {
-                    "objectName": models.DataObject.objects.get(id=object_id).objectName
-                }
+                context["data"] = {"objectName": data_object.objectName}
                 return Response(context, status=status.HTTP_200_OK)
 
             grouped_data = defaultdict(list)
             for spec in specs:
-                # 🔹 Get rules applied for this spec
                 rules_qs = models.RuleApplied.objects.filter(spec=spec)
                 rules_data = [
                     {
@@ -341,20 +413,17 @@ class SpecsAPIView(APIView):
                 grouped_data[spec.tab].append({
                     "id": spec.id,
                     "company": spec.company,
-                    "field_id": (spec.field_id).upper(),  # to upper case
+                    "field_id": (spec.field_id).upper(),
                     "mandatory": spec.mandatory,
                     "allowed_values": spec.allowed_values,
                     "sap_table": spec.sap_table,
                     "sap_field_id": spec.sap_field_id,
                     "sap_description": spec.sap_description,
                     "position": spec.position,
-                    "rules": rules_data,   # 🔹 Add rules here
+                    "rules": rules_data,
                 })
 
-            tab_data = [
-                {"tab": (tab_name).lower(), "fields": fields}
-                for tab_name, fields in grouped_data.items()
-            ]
+            tab_data = [{"tab": tab_name.lower(), "fields": fields} for tab_name, fields in grouped_data.items()]
 
             response_data = {
                 "objectName": specs.first().objectName.objectName,
@@ -380,32 +449,22 @@ class SpecsAPIView(APIView):
                 raise SerializerError(validator.errors)
 
             req_params = validator.validated_data
+            data_object = get_object_or_404(models.DataObject, pk=req_params["objectName"])
 
-            # Convert Yes/No to Boolean
-            # req_params["mandatory"] = True if req_params["mandatory"] == "Yes" else False
+            # 🔹 Check write permission
+            self.check_object_permissions(request, data_object)
 
-            # Convert objectName ID → DataObject instance
-            data_object = get_object_or_404(DataObject, pk=req_params["objectName"])
-            req_params["objectName"] = data_object  
+            req_params["objectName"] = data_object
 
-            # ✅ Auto-assign position based on tab
+            # Auto-assign position based on tab
             existing_fields = models.Specs.objects.filter(
                 objectName=data_object, tab=req_params["tab"]
             ).order_by("position")
 
-            if existing_fields.exists():
-                # Get last field position and increment
-                last_position = existing_fields.last().position or 0
-                req_params["position"] = last_position + 1
-            else:
-                # No fields in this tab → start at 0
-                req_params["position"] = 0
+            req_params["position"] = existing_fields.last().position + 1 if existing_fields.exists() else 0
 
-            # Create new Specs record
             spec_instance = models.Specs.objects.create(**req_params)
-            print(req_params,'--------------->>>>>>')
             context["data"] = serializers.SpecsSerializer(spec_instance).data
-            
 
         except Exception as e:
             context["success"] = 0
@@ -415,72 +474,57 @@ class SpecsAPIView(APIView):
     def put(self, request, id=None, *args, **kwargs):
         context = {"success": 1, "message": "Data updated successfully", "data": {}}
         try:
-            # ✅ validate incoming data"
+            spec_instance = get_object_or_404(models.Specs, pk=id)
+
+            # 🔹 Check write permission
+            self.check_object_permissions(request, spec_instance)
+
             validator = validators.SpecsUpdateValidator(data=request.data)
             if not validator.is_valid():
                 raise SerializerError(validator.errors)
 
             req_params = validator.validated_data
 
-            # ✅ convert Yes/No to Boolean (if coming as text)"
-            # if isinstance(req_params.get("mandatory"), str):
-            #     req_params["mandatory"] = True if req_params["mandatory"] == "Yes" else False
-
-            # ✅ fetch the Specs record at respective id--",id
-            spec_instance = get_object_or_404(models.Specs, pk=id)
-
-            # ✅ update objectName foreign key if passed"
             if "objectName" in req_params:
-                data_object = get_object_or_404(DataObject, pk=req_params["objectName"])
+                data_object = get_object_or_404(models.DataObject, pk=req_params["objectName"])
+                self.check_object_permissions(request, data_object)
                 req_params["objectName"] = data_object
 
-            # ✅ handle allowed_values (list or string)"
-            if "allowed_values" in req_params:
-                if isinstance(req_params["allowed_values"], str):
-                    req_params["allowed_values"] = [
-                        v.strip() for v in req_params["allowed_values"].split(",") if v.strip()
-                    ]
+            if "allowed_values" in req_params and isinstance(req_params["allowed_values"], str):
+                req_params["allowed_values"] = [
+                    v.strip() for v in req_params["allowed_values"].split(",") if v.strip()
+                ]
 
-            # ✅ update fields"
             for key, value in req_params.items():
                 setattr(spec_instance, key, value)
             spec_instance.save()
 
-            # ✅ return updated record"
             context["data"] = serializers.SpecsSerializer(spec_instance).data
 
         except Exception as e:
             context["success"] = 0
             context["message"] = str(e)
         return Response(context)
-    
-    def delete(self, request,id=None):
-        context = {
-            "success": 1,
-            "message": messages.DATA_DELETED,
-            "data": {},
-        }
+
+    def delete(self, request, id=None):
+        context = {"success": 1, "message": messages.DATA_DELETED, "data": {}}
         try:
-            record_id = id
-            if not record_id:
-                raise Exception("ID is required for delete")
+            spec_instance = get_object_or_404(models.Specs, pk=id)
 
-            module_obj = models.Specs.objects.get(id=record_id)
-            module_obj.delete()
+            # 🔹 Check write permission
+            self.check_object_permissions(request, spec_instance)
 
-        except models.Specs.DoesNotExist:
-            context["success"] = 0
-            context["message"] = "Record not found"
+            spec_instance.delete()
+
         except Exception as e:
             context["success"] = 0
             context["message"] = str(e)
-
         return Response(context)
 
-
+# neww added release or request processing permission check
 class ReorderSpecsView(APIView):
     authentication_classes = [JWTAuthentication]
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, DataObjectWriteLockPermission]
 
     def put(self, request, *args, **kwargs):
         try:
@@ -490,6 +534,10 @@ class ReorderSpecsView(APIView):
 
             if not object_id or not tab or not fields:
                 return Response({"success": 0, "message": "Invalid data"}, status=status.HTTP_400_BAD_REQUEST)
+
+            # 🔹 Fetch DataObject and check permission
+            data_object = get_object_or_404(models.DataObject, id=object_id)
+            self.check_object_permissions(request, data_object)
 
             # update positions
             for field in fields:
@@ -507,12 +555,40 @@ class ReorderSpecsView(APIView):
         except Exception as e:
             return Response({"success": 0, "message": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
+# OLD
+# class ReorderSpecsView(APIView):
+#     authentication_classes = [JWTAuthentication]
+#     permission_classes = [IsAuthenticated,DataObjectWriteLockPermission]
 
+#     def put(self, request, *args, **kwargs):
+#         try:
+#             object_id = request.data.get("objectName_id")
+#             tab = request.data.get("tab")
+#             fields = request.data.get("fields", [])
 
+#             if not object_id or not tab or not fields:
+#                 return Response({"success": 0, "message": "Invalid data"}, status=status.HTTP_400_BAD_REQUEST)
 
+#             # update positions
+#             for field in fields:
+#                 field_id = field.get("id")
+#                 position = field.get("position")
+#                 if field_id is not None and position is not None:
+#                     models.Specs.objects.filter(
+#                         id=field_id,
+#                         objectName_id=object_id,
+#                         tab=tab
+#                     ).update(position=position)
+
+#             return Response({"success": 1, "message": "Reordering saved successfully"}, status=status.HTTP_200_OK)
+
+#         except Exception as e:
+#             return Response({"success": 0, "message": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+# not using
 class SpecsTemplateDownloadAPIView(APIView):
-    authentication_classes = [JWTAuthentication]
-    permission_classes = [IsAuthenticated]
+    # authentication_classes = [JWTAuthentication]
+    # permission_classes = [IsAuthenticated,DataObjectWriteLockPermission]
 
     def get(self, request, *args, **kwargs):
         context = {"success": 1, "message": "Template generated successfully", "data": {}}
@@ -525,7 +601,7 @@ class SpecsTemplateDownloadAPIView(APIView):
             # ✅ Define Specs model fields (exclude id/auto fields if required)
             fields = [
                 "company",
-                "objectName_id",
+                "objectName",
                 "tab",
                 "field_id",   
                 "mandatory",        # Yes / No
@@ -568,9 +644,10 @@ class SpecsTemplateDownloadAPIView(APIView):
             return JsonResponse(context, status=500)
 
 
+# not using
 class SpecsTemplateUploadAPIView(APIView):
     authentication_classes = [JWTAuthentication]
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated,DataObjectWriteLockPermission]
 
     def post(self, request, *args, **kwargs):
         context = {"success": 1, "message": "Data uploaded successfully", "data": []}
@@ -666,7 +743,7 @@ class CustomRuleTemplateUIViewSet(viewsets.ModelViewSet):
     """
 
     authentication_classes = [JWTAuthentication]
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated,DataObjectWriteLockPermission]
 
     queryset = models.CustomRuleTemplateUI.objects.all()
     serializer_class = serializers.CustomRuleTemplateUISerializer
@@ -685,7 +762,7 @@ class CustomRuleTemplateUIViewSet(viewsets.ModelViewSet):
 
 class AllRulesView(APIView):
     authentication_classes = [JWTAuthentication]
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated,DataObjectWriteLockPermission]
 
     def get(self, request):
         context = {
@@ -703,27 +780,141 @@ class AllRulesView(APIView):
 
         return Response(context)
 
+
+# old
+# class RuleAppliedView(APIView):
+#     authentication_classes = [JWTAuthentication]
+#     permission_classes = [IsAuthenticated,DataObjectWriteLockPermission]
+
+#     # CREATE (POST)
+#     def post(self, request):
+#         context = {
+#             "success": 1,
+#             "message": "Rule saved successfully",
+#             "data": {}
+#         }
+#         try:
+#             data = request.data
+#             # 1️⃣ Extract source_fields from payload
+#             source_fields = data.get("rule_applied_data", {}).get("source", {})
+#             spec_id = models.DataObject.objects.get(objectName=source_fields.get("spec")).id
+#             print('sourec fields.............................\n',spec_id)
+
+#             # 2️⃣ Find matching Specs record
+#             spec_obj = models.Specs.objects.filter(
+#                 objectName=spec_id,
+#                 tab=source_fields.get("tab"),
+#                 field_id=source_fields.get("field"),
+#             ).first()
+
+#             if not spec_obj:
+#                 context["success"] = 0
+#                 context["message"] = "Spec not found for given source_fields"
+#                 return Response(context, status=status.HTTP_400_BAD_REQUEST)
+
+#             # 3️⃣ Inject spec_field_id before serializer validation
+#             data["spec"] = spec_obj.id
+
+#             serializer = serializers.RuleAppliedSerializer(
+#                 data=data,
+#                 context={"request": request}
+#             )
+#             if serializer.is_valid():
+#                 serializer.save()
+#                 context["data"] = serializer.data
+#             else:
+#                 context["success"] = 0
+#                 context["message"] = "Validation failed"
+#                 context["errors"] = serializer.errors
+#                 return Response(context, status=status.HTTP_400_BAD_REQUEST)
+
+#         except Exception as e:
+#             context["success"] = 0
+#             context["message"] = str(e)
+#             return Response(context, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+#         return Response(context, status=status.HTTP_201_CREATED)
+
+#     # READ (GET Single Rule by ID)
+#     def get(self, request, pk=None):
+#         try:
+#             rule = models.RuleApplied.objects.select_related("spec").get(id=pk)
+#             serializer = serializers.RuleAppliedSerializer(rule)
+#             return Response(serializer.data, status=status.HTTP_200_OK)
+#         except models.RuleApplied.DoesNotExist:
+#             return Response(
+#                 {"success": 0, "message": "Rule not found"},
+#                 status=status.HTTP_404_NOT_FOUND,
+#             )
+#         except Exception as e:
+#             return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+#     # UPDATE (PUT/PATCH)
+#     def put(self, request, pk=None):
+#         context = {"success": 1, "message": "Rule updated successfully", "data": {}}
+#         try:
+#             rule = models.RuleApplied.objects.get(id=pk)
+#             serializer = serializers.RuleAppliedSerializer(
+#                 rule, data=request.data, partial=True, context={"request": request}
+#             )
+#             if serializer.is_valid():
+#                 serializer.save()
+#                 context["data"] = serializer.data
+#             else:
+#                 context["success"] = 0
+#                 context["message"] = "Validation failed"
+#                 context["errors"] = serializer.errors
+#                 return Response(context, status=status.HTTP_400_BAD_REQUEST)
+
+#         except models.RuleApplied.DoesNotExist:
+#             return Response(
+#                 {"success": 0, "message": "Rule not found"},
+#                 status=status.HTTP_404_NOT_FOUND,
+#             )
+#         except Exception as e:
+#             context["success"] = 0
+#             context["message"] = str(e)
+#             return Response(context, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+#         return Response(context, status=status.HTTP_200_OK)
+
+#     # DELETE
+#     def delete(self, request, pk=None):
+#         try:
+#             rule = models.RuleApplied.objects.get(id=pk)
+#             rule.delete()
+#             return Response(
+#                 {"success": 1, "message": "Rule deleted successfully"},
+#                 status=status.HTTP_200_OK,
+#             )
+#         except models.RuleApplied.DoesNotExist:
+#             return Response(
+#                 {"success": 0, "message": "Rule not found"},
+#                 status=status.HTTP_404_NOT_FOUND,
+#             )
+#         except Exception as e:
+#             return Response(
+#                 {"success": 0, "message": str(e)},
+#                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+#             )
+
+# new
 class RuleAppliedView(APIView):
     authentication_classes = [JWTAuthentication]
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, DataObjectWriteLockPermission]
 
     # CREATE (POST)
     def post(self, request):
-        context = {
-            "success": 1,
-            "message": "Rule saved successfully",
-            "data": {}
-        }
+        context = {"success": 1, "message": "Rule saved successfully", "data": {}}
         try:
             data = request.data
-            # 1️⃣ Extract source_fields from payload
+            # Extract source_fields from payload
             source_fields = data.get("rule_applied_data", {}).get("source", {})
-            spec_id = models.DataObject.objects.get(objectName=source_fields.get("spec")).id
-            print('sourec fields.............................\n',spec_id)
+            data_object_id = models.DataObject.objects.get(objectName=source_fields.get("spec")).id
 
-            # 2️⃣ Find matching Specs record
+            # Find matching Specs record
             spec_obj = models.Specs.objects.filter(
-                objectName=spec_id,
+                objectName=data_object_id,
                 tab=source_fields.get("tab"),
                 field_id=source_fields.get("field"),
             ).first()
@@ -733,13 +924,13 @@ class RuleAppliedView(APIView):
                 context["message"] = "Spec not found for given source_fields"
                 return Response(context, status=status.HTTP_400_BAD_REQUEST)
 
-            # 3️⃣ Inject spec_field_id before serializer validation
-            data["spec"] = spec_obj.id
+            # 🔹 Check write permission on the related DataObject
+            self.check_object_permissions(request, spec_obj)
 
-            serializer = serializers.RuleAppliedSerializer(
-                data=data,
-                context={"request": request}
-            )
+            # Inject spec_field_id before serializer validation
+            data["spec"] = spec_obj.id
+            serializer = serializers.RuleAppliedSerializer(data=data, context={"request": request})
+
             if serializer.is_valid():
                 serializer.save()
                 context["data"] = serializer.data
@@ -763,10 +954,7 @@ class RuleAppliedView(APIView):
             serializer = serializers.RuleAppliedSerializer(rule)
             return Response(serializer.data, status=status.HTTP_200_OK)
         except models.RuleApplied.DoesNotExist:
-            return Response(
-                {"success": 0, "message": "Rule not found"},
-                status=status.HTTP_404_NOT_FOUND,
-            )
+            return Response({"success": 0, "message": "Rule not found"}, status=status.HTTP_404_NOT_FOUND)
         except Exception as e:
             return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -774,7 +962,11 @@ class RuleAppliedView(APIView):
     def put(self, request, pk=None):
         context = {"success": 1, "message": "Rule updated successfully", "data": {}}
         try:
-            rule = models.RuleApplied.objects.get(id=pk)
+            rule = get_object_or_404(models.RuleApplied, pk=pk)
+
+            # 🔹 Check write permission via related Spec → DataObject
+            self.check_object_permissions(request, rule)
+
             serializer = serializers.RuleAppliedSerializer(
                 rule, data=request.data, partial=True, context={"request": request}
             )
@@ -788,10 +980,7 @@ class RuleAppliedView(APIView):
                 return Response(context, status=status.HTTP_400_BAD_REQUEST)
 
         except models.RuleApplied.DoesNotExist:
-            return Response(
-                {"success": 0, "message": "Rule not found"},
-                status=status.HTTP_404_NOT_FOUND,
-            )
+            return Response({"success": 0, "message": "Rule not found"}, status=status.HTTP_404_NOT_FOUND)
         except Exception as e:
             context["success"] = 0
             context["message"] = str(e)
@@ -802,26 +991,23 @@ class RuleAppliedView(APIView):
     # DELETE
     def delete(self, request, pk=None):
         try:
-            rule = models.RuleApplied.objects.get(id=pk)
+            rule = get_object_or_404(models.RuleApplied, pk=pk)
+
+            # 🔹 Check write permission via related Spec → DataObject
+            self.check_object_permissions(request, rule)
+
             rule.delete()
-            return Response(
-                {"success": 1, "message": "Rule deleted successfully"},
-                status=status.HTTP_200_OK,
-            )
+            return Response({"success": 1, "message": "Rule deleted successfully"}, status=status.HTTP_200_OK)
+
         except models.RuleApplied.DoesNotExist:
-            return Response(
-                {"success": 0, "message": "Rule not found"},
-                status=status.HTTP_404_NOT_FOUND,
-            )
+            return Response({"success": 0, "message": "Rule not found"}, status=status.HTTP_404_NOT_FOUND)
         except Exception as e:
-            return Response(
-                {"success": 0, "message": str(e)},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            )
+            return Response({"success": 0, "message": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
 class RuleAppliedListView(APIView):
-    permission_classes = [IsAuthenticated]
+    authentication_classes = [JWTAuthentication]
+    permission_classes = [IsAuthenticated,DataObjectWriteLockPermission]
 
     def get(self, request, *args, **kwargs):
         try:
@@ -868,6 +1054,9 @@ class RuleAppliedListView(APIView):
 
 
 class RuleAppliedBySpecView(APIView):
+    authentication_classes = [JWTAuthentication]
+    permission_classes = [IsAuthenticated,DataObjectWriteLockPermission]
+
     def get(self, request, spec_id):
         context = {
             "success": 1,
@@ -892,10 +1081,6 @@ class RuleAppliedBySpecView(APIView):
             context["message"] = f"Failed to fetch rules: {str(e)}"
 
         return Response(context, status=status.HTTP_200_OK)
-
-import pandas as pd
-import io
-from django.core.files.uploadedfile import InMemoryUploadedFile
 
 def clean_excel(uploaded_file):
     """Return a cleaned Excel file object without 'mapping' sheet."""
@@ -931,10 +1116,9 @@ def handle_validated_upload(uploaded_file, obj, object_name):
     os.makedirs(base_dir, exist_ok=True)
     os.makedirs(archive_dir, exist_ok=True)
 
-    print('<<<<<<<<<<<<<<------')
+
     # print(os.getcwd())
     print(os.listdir(base_dir))
-    print('--------->>>>>>>>>>>>>')
 
     # Paths
     main_file_path = os.path.join(base_dir, f"{object_name}.xlsx")
@@ -978,19 +1162,12 @@ def handle_validated_upload(uploaded_file, obj, object_name):
         status=status.HTTP_200_OK,
     )
 
-import tempfile
-from django.core.files import File
-import uuid, threading, time
-from django.core.files.base import File
-from rest_framework.views import APIView
-from rest_framework.response import Response
-from rest_framework import status
-import pandas as pd, tempfile
-from .models import DataObject, Specs
-
 # In-memory progress store (better: Redis/DB in production)
 UPLOAD_PROGRESS = {}
+# OLD
 class FileUploadAPIView(APIView):
+    authentication_classes = [JWTAuthentication]
+    permission_classes = [IsAuthenticated,DataObjectWriteLockPermission]
 
     def get(self, request, id=None):
         """
@@ -1029,10 +1206,30 @@ class FileUploadAPIView(APIView):
         if not serializer.is_valid():
             # print("❌ Serializer validation failed:", serializer.errors)
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+        
+
 
         object_name = serializer.validated_data["objectName"]
         uploaded_file = serializer.validated_data["file"]
-        # print(f"✅ Serializer validated | objectName={object_name}, file={uploaded_file.name}")
+        print(f"✅ Serializer validated | objectName={object_name}, file={uploaded_file.name}")
+
+        # 🔹 Get related DataObject
+        data_object = models.DataObject.objects.filter(objectName=object_name).first()
+        if not data_object:
+            return Response(
+                {"success": 0, "message": f"DataObject '{object_name}' not found"},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        # 🔹 Run object-level permission check
+        try:
+            self.check_object_permissions(request, data_object)
+        except PermissionDenied as e:
+            return Response(
+                {"success": 0, "message": str(e)},
+                status=status.HTTP_403_FORBIDDEN
+    )
+
 
         # Save uploaded file temporarily
         with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp:
@@ -1162,6 +1359,15 @@ class FileUploadAPIView(APIView):
     def delete(self, request, id):
         try:
             file_obj = DataFile.objects.get(pk=id)
+
+            try:
+                self.check_object_permissions(request, file_obj)
+            except PermissionDenied as e:
+                return Response(
+                    {"success": 0, "message": str(e)},
+                    status=status.HTTP_403_FORBIDDEN
+                )
+
             temp = ''
             for i in str(file_obj.file_name):
                 if i!='.':
@@ -1226,16 +1432,12 @@ class FileUploadAPIView(APIView):
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
 
-
 class UploadStatusView(APIView):
     def get(self, request, upload_id):
         progress = UPLOAD_PROGRESS.get(upload_id, 0)
         print(progress,'.....................................................................................')
         return Response({"upload_id": upload_id, "progress": progress})
 
-
-
-from math import isfinite
 
 def sanitize_data(data):
     if isinstance(data, dict):
@@ -1247,11 +1449,10 @@ def sanitize_data(data):
     else:
         return data
 
-# In your view
-
-
-
 class DataFileLatestView(APIView):
+    authentication_classes = [JWTAuthentication]
+    permission_classes = [IsAuthenticated,DataObjectWriteLockPermission]
+
     def get(self, request, object_id):
         try:
             mode = request.query_params.get("mode", "view")  # default = view
@@ -1398,20 +1599,10 @@ class DataFileLatestView(APIView):
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
 
-# views.py
-from rest_framework.views import APIView
-from rest_framework.response import Response
-from rest_framework import status
-from django.db.models import Max
-from .models import DataFile
-from .serializers import DataFileSerializer
-from django.db.models import Max, Q
-from django.db.models import Exists, OuterRef
-from django.db.models import Exists, OuterRef, Max, Q
 class LatestValidatedFilesView(APIView):
     ''' Fetch latest validated (validation=1) file per DataObject '''
     authentication_classes = [JWTAuthentication]
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated,DataObjectWriteLockPermission]
 
     from django.db.models import Exists, OuterRef, Max
 
@@ -1476,24 +1667,6 @@ class LatestValidatedFilesView(APIView):
             return Response(context, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
-from rest_framework.views import APIView
-from rest_framework.response import Response
-from rest_framework import status
-from . import models
-from . CustomValidationFiles.common_rules_validators import run_default_validators
-from . CustomValidationFiles.custom_rule_validator import run_custom_rule_validation
-from . file_utils import get_file_path_with_object_name,get_file_paths
-import time
-from . working_file_manager import create_and_get_working_file_path,delete_working_directory
-from django.utils import timezone
-
-from . file_utils import get_target_specs
-
-# #########################################################################
-import uuid
-from datetime import datetime
-import threading
-
 # Global in-memory store for progress objects
 PROGRESS_STORE = {}
 
@@ -1522,57 +1695,335 @@ def create_progress(task_name: str, data_object):
     return task_id, progress_obj
 
 # 2:19
-def update_progress(task_id: str, progress: int, message: str = ""):
+# def update_progress(task_id: str, progress: int, message: str = ""):
+#     # Update memory
+#     if task_id in PROGRESS_STORE:
+#         PROGRESS_STORE[task_id]["progress"] = progress
+#         if message:
+#             PROGRESS_STORE[task_id]["message"] = message
+#         PROGRESS_STORE[task_id]["updated_at"] = datetime.now().isoformat()
+
+#     # Update DB
+#     try:
+#         vp = models.ValidationProgress.objects.get(task_id=task_id)
+#         vp.progress = progress
+#         if progress >= 100:
+#             vp.status = "completed"
+#         elif progress == 0 and "Error" in message:
+#             vp.status = "failed"
+#         else:
+#             vp.status = "running"
+#         vp.save(update_fields=["progress", "status", "updated_at"])
+#     except models.ValidationProgress.DoesNotExist:
+#         print(f"[DB WARNING] No ValidationProgress found for task {task_id}")
+
+#     print(f"[PROGRESS] {task_id} -> {progress}% | {message}")
+
+# new2
+# def update_progress(task_id: str, progress: int, message: str = "", success: int | None = None):
+#     # Update memory
+#     if task_id in PROGRESS_STORE:
+#         PROGRESS_STORE[task_id]["progress"] = progress
+#         if message:
+#             PROGRESS_STORE[task_id]["message"] = message
+#         PROGRESS_STORE[task_id]["updated_at"] = datetime.now().isoformat()
+#         # ✅ maintain success in memory
+#         if success is not None:
+#             PROGRESS_STORE[task_id]["success"] = success
+#         elif progress == 0 and "Error" in message:
+#             PROGRESS_STORE[task_id]["success"] = 0
+#         elif progress >= 100:
+#             PROGRESS_STORE[task_id]["success"] = 1
+#         else:
+#             PROGRESS_STORE[task_id].setdefault("success", 1)
+
+#     # Update DB
+#     try:
+#         vp = models.ValidationProgress.objects.get(task_id=task_id)
+#         vp.progress = progress
+#         if success is not None:
+#             vp.success = bool(success)
+#         elif progress >= 100:
+#             vp.status = "completed"
+#             vp.success = True
+#         elif progress == 0 and "Error" in message:
+#             vp.status = "failed"
+#             vp.success = False
+#         else:
+#             vp.status = "running"
+#             if vp.success is None:
+#                 vp.success = True
+#         vp.save(update_fields=["progress", "status", "success", "updated_at"])
+#     except models.ValidationProgress.DoesNotExist:
+#         print(f"[DB WARNING] No ValidationProgress found for task {task_id}")
+
+#     print(f"[PROGRESS] {task_id} -> {progress}% | {message}")
+
+# new3
+def update_progress(task_id: str, progress: int, message: str = "", success: int = None):
     # Update memory
     if task_id in PROGRESS_STORE:
         PROGRESS_STORE[task_id]["progress"] = progress
         if message:
             PROGRESS_STORE[task_id]["message"] = message
         PROGRESS_STORE[task_id]["updated_at"] = datetime.now().isoformat()
+        if success is not None:
+            PROGRESS_STORE[task_id]["success"] = success
+        else:
+            if progress >= 100:
+                PROGRESS_STORE[task_id]["success"] = 1
+            elif "Error" in message or "Missing" in message or "not found" in message:
+                PROGRESS_STORE[task_id]["success"] = 0
+            else:
+                PROGRESS_STORE[task_id].setdefault("success", 1)
 
     # Update DB
     try:
         vp = models.ValidationProgress.objects.get(task_id=task_id)
         vp.progress = progress
-        if progress >= 100:
+
+        # Handle success/failure explicitly
+        if progress >= 100 and (success is None or success == 1):
             vp.status = "completed"
-        elif progress == 0 and "Error" in message:
+            vp.success = True
+        elif success == 0 or "Error" in message or "Missing" in message or "not found" in message:
             vp.status = "failed"
+            vp.success = False
         else:
             vp.status = "running"
-        vp.save(update_fields=["progress", "status", "updated_at"])
+            if vp.success is None:
+                vp.success = True
+
+        vp.save(update_fields=["progress", "status", "success", "updated_at"])
     except models.ValidationProgress.DoesNotExist:
         print(f"[DB WARNING] No ValidationProgress found for task {task_id}")
 
-    print(f"[PROGRESS] {task_id} -> {progress}% | {message}")
+    print(f"[PROGRESS] {task_id} -> {progress}% | {message} | success={PROGRESS_STORE.get(task_id, {}).get('success')}")
 
+# new1
+# def update_progress(task_id: str, progress: int, message: str = ""):
+#     # Update memory
+#     if task_id in PROGRESS_STORE:
+#         PROGRESS_STORE[task_id]["progress"] = progress
+#         if message:
+#             PROGRESS_STORE[task_id]["message"] = message
+#         PROGRESS_STORE[task_id]["updated_at"] = datetime.now().isoformat()
+#         # ✅ maintain success in memory
+#         if progress == 0 and "Error" in message:
+#             PROGRESS_STORE[task_id]["success"] = 0
+#         elif progress >= 100:
+#             PROGRESS_STORE[task_id]["success"] = 1
+#         else:
+#             PROGRESS_STORE[task_id].setdefault("success", 1)
 
-def get_progress(task_id: str):
-    return PROGRESS_STORE.get(task_id, {"progress": 0, "message": ""})
+#     # Update DB
+#     try:
+#         vp = models.ValidationProgress.objects.get(task_id=task_id)
+#         vp.progress = progress
+#         if progress >= 100:
+#             vp.status = "completed"
+#             vp.success = True
+#         elif progress == 0 and "Error" in message:
+#             vp.status = "failed"
+#             vp.success = False
+#         else:
+#             vp.status = "running"
+#             # keep current success if already False
+#             if vp.success is None:
+#                 vp.success = True
+#         vp.save(update_fields=["progress", "status", "success", "updated_at"])
+#     except models.ValidationProgress.DoesNotExist:
+#         print(f"[DB WARNING] No ValidationProgress found for task {task_id}")
 
-# 8:23 /////
+#     print(f"[PROGRESS] {task_id} -> {progress}% | {message}")
+
+# OLD
+# def get_progress(task_id: str):
+#     return PROGRESS_STORE.get(task_id, {"progress": 0, "message": ""})
+def get_progress(task_id):
+    """
+    Fetch the latest progress for a given task_id.
+    Always returns 'success' key (default=1).
+    """
+    progress = PROGRESS_STORE.get(task_id, {})
+    return {
+        "task_id": task_id,
+        "progress": progress.get("progress", 0),
+        "message": progress.get("message", "No progress yet"),
+        "success": progress.get("success", 1)  # ✅ default to 1
+    }
+
+# OLD
+# def run_validation_in_background(task_id, data_object_id, request_data):
+#     """All heavy validation logic moved here."""
+#     try:
+#         update_progress(task_id, 5, "Fetching DataObject")
+#         print(f"[Thread] Fetching DataObject {data_object_id}")
+#         data_object = models.DataObject.objects.filter(id=data_object_id).first()
+#         if not data_object:
+#             update_progress(task_id, 6, "DataObject not found")
+#             print("[Thread ERROR] DataObject not found")
+#             return
+
+#         # Check own file
+#         update_progress(task_id, 6, "Checking main data file")
+#         print("[Thread] Checking main data file")
+#         own_file_exists = models.DataFile.objects.filter(data_object=data_object, version=0).exists()
+#         if not own_file_exists:
+#             update_progress(task_id, 7, f"Data file for '{data_object.objectName}' not found")
+#             print(f"[Thread ERROR] Data file for '{data_object.objectName}' not found")
+#             return
+
+#         # Check dependencies
+#         update_progress(task_id, 7, "Checking dependencies")
+#         print("[Thread] Checking dependencies")
+#         dependencies = data_object.dependencies or []
+#         rules_applied_qs = models.RuleApplied.objects.filter(spec__objectName=data_object.id)
+#         target_objects_dependencies = []
+#         for rule in rules_applied_qs:
+#             targets = get_target_specs(rule.rule_applied_data)
+#             target_objects_dependencies.extend(targets)
+#         dependencies = list(set(dependencies + target_objects_dependencies))
+#         update_progress(task_id, 8, "verifying depenedency files..")
+
+#         missing_files = []
+#         for dep_name in dependencies:
+#             dep_object = models.DataObject.objects.filter(objectName=dep_name).first()
+#             if not dep_object or not models.DataFile.objects.filter(data_object=dep_object, version=0).exists():
+#                 missing_files.append(dep_name)
+#                 print(f"[Thread] Missing dependency: {dep_name}")
+#         if missing_files:
+#             update_progress(task_id, 9, f"Missing dependencies: {', '.join(missing_files)}")
+#             print(f"[Thread ERROR] Missing dependencies: {', '.join(missing_files)}")
+#             return
+
+#         update_progress(task_id, 9, "Dependencies validated")
+#         print("[Thread] Dependencies validated")
+
+#         # Start default validations
+#         update_progress(task_id, 10, "Running default validations")
+#         paths = create_and_get_working_file_path(request_data.get("dataObjectId"))
+#         print(f"[Thread] Working paths: {paths}")
+#         resultLog1 = run_default_validators(
+#             file_path=paths.get('working_file_path'),
+#             log_file_path=paths.get('working_log_file_path'),
+#             primary_field=request_data.get("fieldId"),
+#             task_id=task_id,
+#             update_progress_fun=update_progress
+#         )
+#         update_progress(task_id, 65, "default Validation completed successfully")
+#         # delete_working_directory(paths.get('working_file_path'))
+#         print("[Thread] Deleted working directory")
+
+#         # Prepare logs
+#         update_progress(task_id, 68, "Processing logs")
+#         source_file = get_file_path_with_object_name(data_object.objectName)
+#         working_log_file_path = paths.get('working_log_file_path')
+#         try:
+#             with open(working_log_file_path, "rb") as f:
+#                 existing_log = pd.read_excel(f)
+#             print(f"[Thread] Existing log loaded. Rows: {len(existing_log)}")
+#         except FileNotFoundError:
+#             existing_log = pd.DataFrame(columns=["primary_field", "rule_data", "time"])
+#             print("[Thread] No existing log found, created empty log")
+
+#         # Run custom rule validations
+#         ###############################################
+#         update_progress(task_id, 70, "Running custom rule validations")
+#         new_logs_list = []
+#         rules_applied_qs = models.RuleApplied.objects.filter(spec__objectName=data_object.id)
+#         targets_obj = {}
+#         total_rules = rules_applied_qs.count()
+
+#         for i, rule in enumerate(rules_applied_qs):
+#             targets = get_target_specs(json_spec=rule.rule_applied_data)
+#             for obj in targets:
+#                 targets_obj[obj] = get_file_path_with_object_name(obj)
+#             print(f"[Thread] Running custom rule {rule.id} on targets: {targets_obj}")
+
+#             resultLog2 = run_custom_rule_validation(
+#                 rule_name=rule.rule_applied,
+#                 json_spec=rule.rule_applied_data,
+#                 source_file=source_file,
+#                 target_files=targets_obj,
+#                 rule_description=rule.description or ""
+#             )
+#             print(f"[Thread] Custom rule {rule.id} produced {len(resultLog2)} logs")
+#             new_logs_list.append(pd.DataFrame(resultLog2, columns=["primary_field", "rule_data", "time"]))
+
+#             # Update progress for this rule
+#             if task_id and total_rules > 0:
+#                 incremental_progress = int((i + 1) / total_rules * 25)  # 25% for this loop
+#                 update_progress(task_id, 70 + incremental_progress, f"Running custom rule {i + 1}/{total_rules}")
+
+#         ############
+#         if new_logs_list:
+#             all_new_logs = pd.concat(new_logs_list, ignore_index=True)
+#             final_log = pd.concat([existing_log, all_new_logs], ignore_index=True)
+#         else:
+#             final_log = existing_log
+
+#         with pd.ExcelWriter(working_log_file_path, engine="openpyxl", mode="w") as writer:
+#             final_log.to_excel(writer, index=False)
+
+#         actual_log_file_path = os.path.join(paths.get('logging_dir'), paths.get("log_file_name"))
+
+#         # Copy working log file to actual log file
+#         with pd.ExcelFile(working_log_file_path) as xls:
+#             with pd.ExcelWriter(actual_log_file_path, engine="openpyxl") as writer:
+#                 # Copy existing sheets
+#                 for sheet in xls.sheet_names:
+#                     df = xls.parse(sheet)
+#                     df.to_excel(writer, sheet_name=sheet, index=False)
+
+#         delete_working_directory(paths.get('working_file_path'))
+#         update_progress(task_id, 98, "written in log file successfully !")
+#         print("[Thread] Final log written to Excel")
+
+#         # Update DataFile validation status
+#         data_file = models.DataFile.objects.filter(data_object=data_object, version=0).first()
+#         if data_file:
+#             if not final_log.empty:
+#                 # data_file.validation = models.DataFile.ValidationStatus.FAILED
+#                 data_file.status = "VALIDATION COMPLETED WITH ERRORS"
+#             else:
+#                 # data_file.validation = models.DataFile.ValidationStatus.VALIDATED
+#                 data_file.status = "VALIDATION COMPLETED WITH NO ERRORS"
+
+#             data_file.validated_at = timezone.now()
+#             data_file.validation = 1
+#             data_file.save()
+#             print("[Thread] DataFile validation updated")
+
+#         update_progress(task_id, 100, "Validation completed successfully")
+#         print("[Thread] Validation completed successfully")
+
+#     except Exception as e:
+#         update_progress(task_id, 0, f"Error: {str(e)}")
+#         print(f"[Thread ERROR] {str(e)}")
+
 def run_validation_in_background(task_id, data_object_id, request_data):
     """All heavy validation logic moved here."""
     try:
-        update_progress(task_id, 5, "Fetching DataObject")
+        update_progress(task_id, 5, "Fetching DataObject", success=1)
         print(f"[Thread] Fetching DataObject {data_object_id}")
         data_object = models.DataObject.objects.filter(id=data_object_id).first()
         if not data_object:
-            update_progress(task_id, 6, "DataObject not found")
+            update_progress(task_id, 6, "DataObject not found", success=0)
             print("[Thread ERROR] DataObject not found")
             return
 
         # Check own file
-        update_progress(task_id, 6, "Checking main data file")
+        update_progress(task_id, 6, "Checking main data file", success=1)
         print("[Thread] Checking main data file")
         own_file_exists = models.DataFile.objects.filter(data_object=data_object, version=0).exists()
         if not own_file_exists:
-            update_progress(task_id, 7, f"Data file for '{data_object.objectName}' not found")
+            update_progress(task_id, 7, f"Data file for '{data_object.objectName}' not found", success=0)
             print(f"[Thread ERROR] Data file for '{data_object.objectName}' not found")
             return
 
         # Check dependencies
-        update_progress(task_id, 7, "Checking dependencies")
+        update_progress(task_id, 7, "Checking dependencies", success=1)
         print("[Thread] Checking dependencies")
         dependencies = data_object.dependencies or []
         rules_applied_qs = models.RuleApplied.objects.filter(spec__objectName=data_object.id)
@@ -1581,7 +2032,7 @@ def run_validation_in_background(task_id, data_object_id, request_data):
             targets = get_target_specs(rule.rule_applied_data)
             target_objects_dependencies.extend(targets)
         dependencies = list(set(dependencies + target_objects_dependencies))
-        update_progress(task_id, 8, "verifying depenedency files..")
+        update_progress(task_id, 8, "Verifying dependency files...", success=1)
 
         missing_files = []
         for dep_name in dependencies:
@@ -1590,15 +2041,15 @@ def run_validation_in_background(task_id, data_object_id, request_data):
                 missing_files.append(dep_name)
                 print(f"[Thread] Missing dependency: {dep_name}")
         if missing_files:
-            update_progress(task_id, 9, f"Missing dependencies: {', '.join(missing_files)}")
+            update_progress(task_id, 9, f"Missing dependencies: {', '.join(missing_files)}", success=0)
             print(f"[Thread ERROR] Missing dependencies: {', '.join(missing_files)}")
             return
 
-        update_progress(task_id, 9, "Dependencies validated")
+        update_progress(task_id, 9, "Dependencies validated", success=1)
         print("[Thread] Dependencies validated")
 
         # Start default validations
-        update_progress(task_id, 10, "Running default validations")
+        update_progress(task_id, 10, "Running default validations", success=1)
         paths = create_and_get_working_file_path(request_data.get("dataObjectId"))
         print(f"[Thread] Working paths: {paths}")
         resultLog1 = run_default_validators(
@@ -1608,12 +2059,11 @@ def run_validation_in_background(task_id, data_object_id, request_data):
             task_id=task_id,
             update_progress_fun=update_progress
         )
-        update_progress(task_id, 65, "default Validation completed successfully")
-        # delete_working_directory(paths.get('working_file_path'))
+        update_progress(task_id, 65, "Default validation completed successfully", success=1)
         print("[Thread] Deleted working directory")
 
         # Prepare logs
-        update_progress(task_id, 68, "Processing logs")
+        update_progress(task_id, 68, "Processing logs", success=1)
         source_file = get_file_path_with_object_name(data_object.objectName)
         working_log_file_path = paths.get('working_log_file_path')
         try:
@@ -1625,9 +2075,7 @@ def run_validation_in_background(task_id, data_object_id, request_data):
             print("[Thread] No existing log found, created empty log")
 
         # Run custom rule validations
-       
-        ###############################################
-        update_progress(task_id, 70, "Running custom rule validations")
+        update_progress(task_id, 70, "Running custom rule validations", success=1)
         new_logs_list = []
         rules_applied_qs = models.RuleApplied.objects.filter(spec__objectName=data_object.id)
         targets_obj = {}
@@ -1652,11 +2100,9 @@ def run_validation_in_background(task_id, data_object_id, request_data):
             # Update progress for this rule
             if task_id and total_rules > 0:
                 incremental_progress = int((i + 1) / total_rules * 25)  # 25% for this loop
-                update_progress(task_id, 70 + incremental_progress, f"Running custom rule {i + 1}/{total_rules}")
+                update_progress(task_id, 70 + incremental_progress, f"Running custom rule {i + 1}/{total_rules}", success=1)
 
-        ############
-        #######
-        ##########
+        # Merge logs
         if new_logs_list:
             all_new_logs = pd.concat(new_logs_list, ignore_index=True)
             final_log = pd.concat([existing_log, all_new_logs], ignore_index=True)
@@ -1671,49 +2117,57 @@ def run_validation_in_background(task_id, data_object_id, request_data):
         # Copy working log file to actual log file
         with pd.ExcelFile(working_log_file_path) as xls:
             with pd.ExcelWriter(actual_log_file_path, engine="openpyxl") as writer:
-                # Copy existing sheets
                 for sheet in xls.sheet_names:
                     df = xls.parse(sheet)
                     df.to_excel(writer, sheet_name=sheet, index=False)
 
         delete_working_directory(paths.get('working_file_path'))
-        update_progress(task_id, 98, "written in log file successfully !")
+        update_progress(task_id, 98, "Written in log file successfully!", success=1)
         print("[Thread] Final log written to Excel")
 
         # Update DataFile validation status
         data_file = models.DataFile.objects.filter(data_object=data_object, version=0).first()
         if data_file:
             if not final_log.empty:
-                # data_file.validation = models.DataFile.ValidationStatus.FAILED
-                data_file.status = "VALIDATION FAILED"
+                data_file.status = "VALIDATION COMPLETED WITH ERRORS"
             else:
-                # data_file.validation = models.DataFile.ValidationStatus.VALIDATED
-                data_file.status = "VALIDATED SUCCESSFULLY"
+                data_file.status = "VALIDATION COMPLETED WITH NO ERRORS"
 
             data_file.validated_at = timezone.now()
             data_file.validation = 1
             data_file.save()
             print("[Thread] DataFile validation updated")
 
-        update_progress(task_id, 100, "Validation completed successfully")
+        update_progress(task_id, 100, "Validation completed successfully", success=1)
         print("[Thread] Validation completed successfully")
 
     except Exception as e:
-        update_progress(task_id, 0, f"Error: {str(e)}")
+        update_progress(task_id, 0, f"Error: {str(e)}", success=0)
         print(f"[Thread ERROR] {str(e)}")
 
-
-
-# 1:54///
-from django.db import transaction
 
 # 8:34///
 class PreValidationCheckAndValidationView(APIView):
     authentication_classes = [JWTAuthentication]
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated,DataObjectWriteLockPermission]
 
     def post(self, request, data_object_id):
         print(f"\n[API] Validation API called with data_object_id: {data_object_id}")
+
+        # 🔹 Fetch the object
+        data_object = get_object_or_404(models.DataObject, id=data_object_id)
+
+        try:
+        # 🔹 Check object-level permissions
+            self.check_object_permissions(request, data_object)
+        except PermissionDenied as e:
+            return Response(
+                {
+                    "success": 0,
+                    "message": str(e) or "You do not have permission to perform this action.",
+                },
+                status=status.HTTP_403_FORBIDDEN,
+            )
 
         # 🔹 Step 1: Check if this object already has a running validation
         existing_in_progress = models.ValidationProgress.objects.filter(
@@ -1762,12 +2216,38 @@ class PreValidationCheckAndValidationView(APIView):
         }, status=status.HTTP_200_OK)
 
 # 1:56 /////
+# class ValidationProgressView(APIView):
+#     authentication_classes = [JWTAuthentication]
+#     permission_classes = [IsAuthenticated,DataObjectWriteLockPermission]
+
+#     def get(self, request, task_id):
+#         # First check DB
+#         try:
+#             vp = models.ValidationProgress.objects.get(task_id=task_id)
+#             data = {
+#                 "task_id": vp.task_id,
+#                 "progress": vp.progress,
+#                 "status": vp.status,
+#                 "updated_at": vp.updated_at.isoformat(),
+#                 "source": "db"
+#             }
+#         except models.ValidationProgress.DoesNotExist:
+#             # Fall back to memory store
+#             data = PROGRESS_STORE.get(task_id, {
+#                 "task_id": task_id,
+#                 "progress": 0,
+#                 "message": "Task not found",
+#                 "source": "memory"
+#             })
+
+#         return Response({"success": 1, "data": data})
+
+# new
 class ValidationProgressView(APIView):
     authentication_classes = [JWTAuthentication]
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, DataObjectWriteLockPermission]
 
     def get(self, request, task_id):
-        # First check DB
         try:
             vp = models.ValidationProgress.objects.get(task_id=task_id)
             data = {
@@ -1775,50 +2255,20 @@ class ValidationProgressView(APIView):
                 "progress": vp.progress,
                 "status": vp.status,
                 "updated_at": vp.updated_at.isoformat(),
-                "source": "db"
+                "success": 1 if vp.success else 0,   # ✅ include DB success
+                "source": "db",
             }
         except models.ValidationProgress.DoesNotExist:
-            # Fall back to memory store
-            data = PROGRESS_STORE.get(task_id, {
+            memory_data = PROGRESS_STORE.get(task_id, {
                 "task_id": task_id,
                 "progress": 0,
                 "message": "Task not found",
-                "source": "memory"
+                "success": 0,  # ✅ default fail in memory if not found
+                "source": "memory",
             })
+            data = memory_data
 
-        return Response({"success": 1, "data": data})
-
-
-import os
-import glob
-import pandas as pd
-from django.conf import settings
-from rest_framework.views import APIView
-from rest_framework.response import Response
-from rest_framework import status
-
-
-import os
-import glob
-import pandas as pd
-from django.http import FileResponse
-from rest_framework.views import APIView
-from rest_framework.response import Response
-from rest_framework import status
-from django.conf import settings
-
-import os
-import glob
-import pandas as pd
-from django.conf import settings
-from django.http import FileResponse
-from rest_framework.views import APIView
-from rest_framework.response import Response
-from rest_framework import status
-from rest_framework.permissions import IsAuthenticated
-from rest_framework_simplejwt.authentication import JWTAuthentication
-
-
+        return Response({"success": data.get("success", 0), "data": data})
 
 class GetLatestLogDataView(APIView):
     """
@@ -1826,7 +2276,7 @@ class GetLatestLogDataView(APIView):
     If `?download=1` is passed, returns the file for download.
     """
     authentication_classes = [JWTAuthentication]
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated,DataObjectWriteLockPermission]
 
     def get(self, request, object_name):
         context = {
@@ -1878,22 +2328,13 @@ class GetLatestLogDataView(APIView):
             status=status.HTTP_200_OK if context["success"] else status.HTTP_500_INTERNAL_SERVER_ERROR
         )
 
-import os
-import glob
-import shutil
-import tempfile
-from django.conf import settings
-from django.http import HttpResponse, Http404
-from rest_framework.views import APIView
-from rest_framework.permissions import IsAuthenticated
-from rest_framework_simplejwt.authentication import JWTAuthentication
 
 class DownloadLatestLogAPIView(APIView):
     """
     API to download the latest Excel log file for a given object_name.
     """
-    # authentication_classes = [JWTAuthentication]
-    # permission_classes = [IsAuthenticated]
+    authentication_classes = [JWTAuthentication]
+    permission_classes = [IsAuthenticated,DataObjectWriteLockPermission]
 
     def get(self, request, object_name):
         # Log directory path
@@ -1926,11 +2367,6 @@ class DownloadLatestLogAPIView(APIView):
             )
             response["Content-Disposition"] = f'attachment; filename="{file_name}"'
             return response  # temporary file is deleted automatically
-
-
-import uuid, time, threading
-from django.http import JsonResponse
-from django.views.decorators.csrf import csrf_exempt
 
 UPLOAD_PROGRESS = {}  # store progress in memory (use Redis/DB in production)
 
@@ -1966,22 +2402,6 @@ def upload_status(request, upload_id):
     progress = UPLOAD_PROGRESS.get(upload_id, 0)
     return JsonResponse({"upload_id": upload_id, "progress": progress})
 
-
-
-from django.core.mail import EmailMessage
-from django.conf import settings
-from django.urls import reverse
-from rest_framework.views import APIView
-from rest_framework.response import Response
-from rest_framework import status
-from django.core.signing import TimestampSigner, BadSignature, SignatureExpired
-from django.http import HttpResponseForbidden
-from django.shortcuts import render, redirect, get_object_or_404
-import os
-import threading
-
-from . import models
-
 signer = TimestampSigner()
 
 class RequestApprovalView(APIView):
@@ -1991,6 +2411,9 @@ class RequestApprovalView(APIView):
     - cancel_approval → cancel existing approval (set status back to waiting)
     - cancel_progress → disable latest dynamic link (make it unusable)
     """
+
+    authentication_classes = [JWTAuthentication]
+    permission_classes = [IsAuthenticated,DataObjectWriteLockPermission]
 
     def post(self, request, pk):
         try:
@@ -2178,323 +2601,6 @@ class RequestApprovalView(APIView):
             print(f"💥 Exception occurred: {str(e)}")
             return Response({"success": 0, "message": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
-
-# 5:53
-# class RequestApprovalView(APIView):
-#     """
-#     API endpoint to handle approval requests:
-#     - REQUESTING_FOR_APPROVAL → send approval email with attachments and dynamic link
-#     - REQUEST_TO_CANCEL_APPROVAL → cancel existing approval (set status back to waiting)
-#     - TO_CANCEL_PROGRESS → disable latest dynamic link (make it unusable)
-#     """
-
-#     def post(self, request, pk):
-#         try:
-#             file_obj = get_object_or_404(models.DataFile, pk=pk)
-#             object_name = file_obj.data_object.objectName
-
-#             # Get flag from request
-#             flag = request.data.get("flag")  # e.g. REQUESTING_FOR_APPROVAL, REQUEST_TO_CANCEL_APPROVAL, TO_CANCEL_PROGRESS
-#             if not flag:
-#                 return Response({"success": 0, "message": "Flag is required"}, status=status.HTTP_400_BAD_REQUEST)
-
-#             # ---------------------------------------------------
-#             # 1. REQUESTING_FOR_APPROVAL
-#             # ---------------------------------------------------
-#             if flag == "approval":
-#                 if file_obj.validation == 0:
-#                     return Response({"success": 0, "message": "File is not validated yet"})
-
-#                 elif file_obj.approval_status==models.DataFile.ApprovalStatus.APPROVED or file_obj.release == True:
-#                     return Response({"success":0,"message":"file is already approved"})
-
-#                 elif file_obj.request_progress == 1:
-#                     return Response({"success":0,"message":"file is already in Request Progress"})
-                            
-#                 # Get file paths
-#                 data_file_path, log_file_path = get_file_paths(object_name, file_obj.file_name)
-
-#                 # Generate dynamic signed token
-#                 token = signer.sign(str(file_obj.id))
-#                 approve_url = request.build_absolute_uri(
-#                     reverse("approval-form", args=[token])
-#                 )
-
-#                 subject = f"Approval Request for Data Load {object_name} (Valid 24 hrs)"
-#                 body = f"""
-#                     Hello Approver,
-
-#                     Please find attached the data load file for {object_name} for your review and approval.
-
-#                     Click the link below to approve or reject the data load:
-#                     {approve_url}
-
-#                     Note: This link will expire in 24 hours or once the action is taken.
-
-#                     Thank you,
-#                     Data Load Team
-#                     """
-
-#                 email = EmailMessage(
-#                     subject,
-#                     body,
-#                     settings.DEFAULT_FROM_EMAIL,
-#                     ['sivakrishna.aar@gmail.com'],
-#                 )
-
-#                 # Attach files
-#                 if os.path.exists(data_file_path):
-#                     email.attach_file(data_file_path)
-#                 if log_file_path and os.path.exists(log_file_path):
-#                     email.attach_file(log_file_path)
-
-#                 email.send()
-
-#                 # Update file approval status
-#                 # file_obj.approval_status = models.DataFile.ApprovalStatus.WAITING
-#                 # file_obj.approval_link_used = False
-#                 file_obj.approval_token = token   # ✅ Save token in DB
-#                 file_obj.request_progress = 1     # ✅ Progress started
-#                 file_obj.save()
-
-#                 return Response({"success": 1, "message": "Approval email sent successfully."}, status=status.HTTP_200_OK)
-
-#             # ---------------------------------------------------
-#             # 2. REQUEST_TO_CANCEL_APPROVAL
-#             # ---------------------------------------------------
-#             elif flag == "cancel_approval":
-#                 if file_obj.approval_status == models.DataFile.ApprovalStatus.APPROVED:
-#                     if file_obj.validation == 0:
-#                         return Response({"success": 0, "message": "File is not validated yet"})
-
-#                     # elif file_obj.approval_status==models.DataFile.ApprovalStatus.APPROVED:
-#                     #     return Response({"success":0,"message":"file is already approved"})
-
-#                     elif file_obj.request_progress == 1:
-#                         return Response({"success":0,"message":"file is already in Request Progress"})
-                    
-#                     elif file_obj.release == False:
-#                         return Response({"success":0,"message":"file is not in Approved Status"})
-
-#                     file_obj.save()
-
-#                     # Generate dynamic signed token for release
-#                     token = signer.sign(str(file_obj.id))
-#                     release_url = request.build_absolute_uri(
-#                         reverse("approval-form", args=[token])
-#                     )
-
-#                     # Send cancellation email with release link
-#                     subject = f"❌ Approval Cancelation Request for Data Load {object_name}"
-#                     body = f"""
-#                         Hello Approver,
-
-#                         The approval for data load file **{object_name}** has been requested to release or cancel the Approve.
-
-#                         File: {file_obj.file_name}
-#                         Cancelled At: {timezone.now().strftime('%Y-%m-%d %H:%M:%S')}
-
-#                         👉 Click the link below to mark this file as **READY TO UPLOAD**:
-#                         {release_url}
-
-#                         Note: This link will expire in 24 hours or once the action is taken.
-
-#                         Regards,  
-#                         Data Load Team
-#                     """
-
-#                     email = EmailMessage(
-#                         subject,
-#                         body,
-#                         settings.DEFAULT_FROM_EMAIL,
-#                         ['sivakrishna.aar@gmail.com'],   # TODO: replace with dynamic approver email
-#                     )
-#                     email.send()
-
-#                     # Save token
-#                     file_obj.approval_token = token
-#                     file_obj.request_progress = 1 
-#                     file_obj.save()
-
-#                     return Response(
-#                         {"success": 1, "message": "Approval cancel request sent with release link."},
-#                         status=status.HTTP_200_OK,
-#                     )
-#                 else:
-#                     return Response(
-#                         {"success": 0, "message": "File is not in approved state."},
-#                         status=status.HTTP_400_BAD_REQUEST,
-#                     )
-
-#             # ---------------------------------------------------
-#             # 3. TO_CANCEL_PROGRESS
-#             # ---------------------------------------------------
-#             elif flag == "cancel_progress":
-#                 file_obj.request_progress = 0
-#                 file_obj.approval_link_used = True   # disable link
-#                 file_obj.approval_token = None       # clear token
-#                 file_obj.save()
-#                 return Response({"success": 1, "message": "Approval progress cancelled and link disabled."}, status=status.HTTP_200_OK)
-
-#             # ---------------------------------------------------
-#             # Invalid Flag
-#             # ---------------------------------------------------
-#             else:
-#                 return Response({"success": 0, "message": "Invalid flag provided."}, status=status.HTTP_400_BAD_REQUEST)
-
-#         except models.DataFile.DoesNotExist:
-#             return Response({"success": 0, "message": "File not found."}, status=status.HTTP_404_NOT_FOUND)
-#         except Exception as e:
-#             return Response({"success": 0, "message": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
-
-# class RequestApprovalView(APIView):
-#     """
-#     API endpoint to send approval email with attachments and dynamic link
-#     """
-
-#     def post(self, request, pk):
-#         try:
-#             file_obj = get_object_or_404(models.DataFile, pk=pk)
-#             object_name = file_obj.data_object.objectName
-
-#             # Check if validated
-#             if file_obj.validation == 0:
-#                 return Response({"success": 0, "message": "File is not validated yet"})
-
-#             # Get file paths
-#             data_file_path, log_file_path = get_file_paths(object_name, file_obj.file_name)
-
-#             # Generate dynamic signed token
-#             token = signer.sign(str(file_obj.id))  
-#             approve_url = request.build_absolute_uri(
-#                 reverse("approval-form", args=[token])
-#             )
-
-#             subject = f"Approval Request for Data Load {object_name} (Valid 24 hrs)"
-#             body = f"""
-#                 Hello Approver,
-
-#                 Please find attached the data load file for {object_name} for your review and approval.
-
-#                 Click the link below to approve or reject the data load:
-#                 {approve_url}
-
-#                 Note: This link will expire in 24 hours or once the action is taken.
-
-#                 Thank you,
-#                 Data Load Team
-#                 """
-
-#             email = EmailMessage(
-#                 subject,
-#                 body,
-#                 settings.DEFAULT_FROM_EMAIL,
-#                 ['sivakrishna.aar@gmail.com'],
-#             )
-
-#             # Attach files
-#             if os.path.exists(data_file_path):
-#                 email.attach_file(data_file_path)
-#             if log_file_path and os.path.exists(log_file_path):
-#                 email.attach_file(log_file_path)
-
-#             email.send()
-
-#             # Update file approval status
-#             # file_obj.approval_status = models.DataFile.ApprovalStatus.WAITING
-#             file_obj.approval_link_used = False
-#             file_obj.approval_token = token   # ✅ Save token in DB
-#             file_obj.request_progress = 1     # ✅ Progress started
-#             file_obj.save()
-
-#             return Response(
-#                 {"success": 1, "message": "Approval email sent successfully."},
-#                 status=status.HTTP_200_OK,
-#             )
-
-#         except models.DataFile.DoesNotExist:
-#             return Response({"success": 0, "message": "File not found."}, status=status.HTTP_404_NOT_FOUND)
-#         except Exception as e:
-#             return Response({"success": 0, "message": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
-
-# class RequestApprovalView(APIView):
-#     """
-#     API endpoint to send approval email with attachments and dynamic link
-#     """
-
-#     def post(self, request, pk):
-#         try:
-#             file_obj = get_object_or_404(models.DataFile, pk=pk)
-#             object_name = file_obj.data_object.objectName
-
-#             # check weather file is validated or not
-#             print('file validation status is ',file_obj.validation)
-#             if file_obj.validation == 0:
-#                 return Response({"success": 0, "message": "file is not validated yet"})
-                
-#             # Get file paths
-#             data_file_path, log_file_path = get_file_paths(object_name, file_obj.file_name)
-
-#             # Generate dynamic signed token
-#             token = signer.sign(str(file_obj.id))  # timestamped
-#             approve_url = request.build_absolute_uri(
-#                 reverse("approval-form", args=[token])
-#             )
-
-#             subject = f"Approval Request for Data Load {object_name} (Valid 24 hrs)"
-#             body = f"""
-#                 Hello Approver,
-
-#                 Please find attached the data load file for {object_name} for your review and approval.
-
-#                 Click the link below to approve or reject the data load:
-#                 {approve_url}
-
-#                 Note: This link will expire in 24 hours or once the action is taken.
-
-#                 Thank you,
-#                 Data Load Team
-#                 """
-
-#             email = EmailMessage(
-#                 subject,
-#                 body,
-#                 settings.DEFAULT_FROM_EMAIL,
-#                 ['sivakrishna.aar@gmail.com'],
-#             )
-
-#             # Attach files
-#             if os.path.exists(data_file_path):
-#                 email.attach_file(data_file_path)
-#             if log_file_path and os.path.exists(log_file_path):
-#                 email.attach_file(log_file_path)
-
-#             email.send()
-
-#             # Update file approval status
-#             # file_obj.approval_status = 0  # WAITING FOR APPROVAL
-#             if not file_obj.approval_status:
-#                 file_obj.approval_status=0
-#             file_obj.approval_link_used = False   # ✅ allow new link usage
-#             file_obj.save()
-
-#             return Response({"success": 1, "message": "Approval email sent successfully."}, status=status.HTTP_200_OK)
-
-#         except models.DataFile.DoesNotExist:
-#             return Response({"success": 0, "message": "File not found."}, status=status.HTTP_404_NOT_FOUND)
-#         except Exception as e:
-#             return Response({"success": 0, "message": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
-
-from django.shortcuts import render, redirect
-from django.http import HttpResponseForbidden
-from django.utils import timezone
-from django.core.signing import BadSignature, SignatureExpired
-
-from .models import DataFile, ApprovalComment
-
 def approval_form(request, token):
     try:
         file_id = signer.unsign(token, max_age=86400)  # 24hr expiry
@@ -2504,153 +2610,94 @@ def approval_form(request, token):
     except BadSignature:
         return HttpResponseForbidden("❌ Invalid approval link.")
 
-    # 🔹 Check if this token matches the latest one saved
     if file_obj.approval_token != token:
         return HttpResponseForbidden("⚠️ This approval link is no longer valid (a newer link was issued).")
 
-    # 🔹 Check if link was already used once
     if file_obj.approval_link_used:
         return HttpResponseForbidden("⚠️ This approval link has already been used.")
 
     if request.method == "POST":
-        action = request.POST.get("action")
+        action = request.POST.get("action")  # approve / reject
         comment_text = request.POST.get("comment", "").strip()
+
+        if not comment_text:
+            return HttpResponseForbidden("⚠️ Comment is required.")
+
+        # Track values for ApprovalComment
+        action_type = None
+        action_status = None
 
         # --- CASE 1: Initial approval (status = 0)
         if file_obj.approval_status == 0:
             if action == "approve":
                 file_obj.approval_status = 1
                 file_obj.release = True
+                action_type = ApprovalComment.Action.REQUEST
+                action_status = ApprovalComment.ActionStatus.APPROVED
             elif action == "reject":
                 file_obj.approval_status = 2
+                action_type = ApprovalComment.Action.REQUEST
+                action_status = ApprovalComment.ActionStatus.REJECTED
 
         # --- CASE 2: Cancel approval (status = 1)
         elif file_obj.approval_status == 1:
             if action == "approve":
                 file_obj.approval_status = 0
                 file_obj.release = False
+                action_type = ApprovalComment.Action.CANCEL
+                action_status = ApprovalComment.ActionStatus.APPROVED
             elif action == "reject":
                 file_obj.approval_status = 1
+                action_type = ApprovalComment.Action.CANCEL
+                action_status = ApprovalComment.ActionStatus.REJECTED
 
-        # --- CASE 3: Rejected file
+        # --- CASE 3: Rejected file (status = 2)
         elif file_obj.approval_status == 2:
             if action == "approve":
                 file_obj.approval_status = 1
                 file_obj.release = True
+                action_type = ApprovalComment.Action.REQUEST
+                action_status = ApprovalComment.ActionStatus.APPROVED
             elif action == "reject":
                 file_obj.approval_status = 2
+                action_type = ApprovalComment.Action.REQUEST
+                action_status = ApprovalComment.ActionStatus.REJECTED
 
-        # Save main DataFile state
-        file_obj.approval_link_used = True   # 🔹 Mark link as used
+        # Save DataFile state
+        file_obj.approval_link_used = True
         file_obj.request_progress = 0
-        file_obj.approval_token = ''         # 🔹 Clear token after use
+        file_obj.approval_token = ''
         file_obj.approved_at = timezone.now()
 
         if comment_text:
-            file_obj.approver_comment = comment_text  # keep latest comment for quick view
+            file_obj.approver_comment = comment_text
         file_obj.save()
 
-        # 🔹 Always save comment in separate table
-        if comment_text:
-            ApprovalComment.objects.create(
-                data_file=file_obj,
-                comment=comment_text,
-            )
+        # Save comment with action + status
+        ApprovalComment.objects.create(
+            data_file=file_obj,
+            comment=comment_text,
+            action=action_type,
+            action_status=action_status,
+        )
 
         return redirect("approval-success")
 
     return render(request, "approval_form.html", {"file": file_obj})
 
 
-# def approval_form(request, token):
-#     try:
-#         file_id = signer.unsign(token, max_age=86400)  # 24hr expiry
-#         file_obj = DataFile.objects.get(pk=file_id)
-#     except SignatureExpired:
-#         return HttpResponseForbidden("⏳ This approval link has expired (time-based).")
-#     except BadSignature:
-#         return HttpResponseForbidden("❌ Invalid approval link.")
-
-#     # 🔹 Check if link was already used once
-#     if file_obj.approval_link_used:
-#         return HttpResponseForbidden("⚠️ This approval link has already been used.")
-
-#     if request.method == "POST":
-#         action = request.POST.get("action")
-#         comment_text = request.POST.get("comment", "").strip()
-
-#          # --- CASE 1: Initial approval (status = 0)
-#         if file_obj.approval_status == 0:
-#             if action == "approve":
-#                 file_obj.approval_status = 1
-#                 file_obj.release=True
-#             elif action == "reject":
-#                 file_obj.approval_status = 2
-
-#         # --- CASE 2: Cancel approval (status = 1)
-#         elif file_obj.approval_status == 1:
-#             if action == "approve":
-#                 file_obj.approval_status = 0
-#                 file_obj.release=False
-#             elif action == "reject":
-#                 file_obj.approval_status = 1
-
-#         # --- CASE 3: Rejected file
-#         elif file_obj.approval_status == 2:
-#             if action == "approve":
-#                 file_obj.approval_status = 1
-#                 file_obj.release = True
-#             elif action == "reject":
-#                 file_obj.approval_status = 2
-
-
-#         # Save main DataFile state
-#         file_obj.approval_link_used = True   # 🔹 Mark link as used
-#         file_obj.request_progress = 0
-#         file_obj.approval_token = ''
-#         file_obj.approved_at = timezone.now()
-        
-#         if comment_text:  
-#             file_obj.approver_comment = comment_text  # keep latest comment for quick view
-#         file_obj.save()
-
-#         # 🔹 Always save comment in separate table
-#         if comment_text:
-#             ApprovalComment.objects.create(
-#                 data_file=file_obj,
-#                 comment=comment_text,
-#             )
-
-#         return redirect("approval-success")
-
-#     return render(request, "approval_form.html", {"file": file_obj})
-
-
 def approval_success_view(request):
     return render(request, "approval_success.html")
-
-
-
-# from rest_framework.views import APIView
-# from rest_framework.response import Response
-# from rest_framework import status
-# from django.shortcuts import get_object_or_404
-# from .models import DataFile, ApprovalComment
-# from .serializers import ApprovalCommentSerializer
-
-from rest_framework.views import APIView
-from rest_framework.response import Response
-from rest_framework import status
-from .models import DataFile, ApprovalComment
 
 class DataObjectCommentsView(APIView):
     """
     API to fetch all comments for a given data_object_id
     """
+    authentication_classes = [JWTAuthentication]
+    permission_classes = [IsAuthenticated,DataObjectWriteLockPermission]
 
     def get(self, request, data_object_id):
         try:
-            # 🔹 Get all files under this data_object
             files = models.DataFile.objects.filter(data_object_id=data_object_id)
             if not files.exists():
                 return Response(
@@ -2658,27 +2705,471 @@ class DataObjectCommentsView(APIView):
                     status=status.HTTP_404_NOT_FOUND,
                 )
 
-            # 🔹 Fetch all comments related to these files
-            comments = models.ApprovalComment.objects.filter(data_file__in=files).order_by("-created_at")
+            comments = (
+                models.ApprovalComment.objects.filter(data_file__in=files)
+                .select_related("data_file")
+                .order_by("-created_at")
+            )
 
             data = [
                 {
                     "id": c.id,
                     "file_id": c.data_file.id,
-                    "file_name": c.data_file.file_name,
+                    # "file_name": c.data_file.file_name,
+                    "action": getattr(c, "action", None),          # ✅ new
+                    "action_status": getattr(c, "action_status", None),  # ✅ new
                     "comment": c.comment,
                     "created_at": c.created_at.strftime("%Y-%m-%d %H:%M:%S"),
                 }
                 for c in comments
             ]
 
-            return Response(
-                {"success": 1, "data": data},
-                status=status.HTTP_200_OK,
-            )
+            return Response({"success": 1, "data": data}, status=status.HTTP_200_OK)
 
         except Exception as e:
             return Response(
                 {"success": 0, "message": str(e)},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
+
+class SpecsDownloadUploadView(APIView):
+    authentication_classes = [JWTAuthentication]
+    permission_classes = [IsAuthenticated,DataObjectWriteLockPermission]
+
+    def get(self, request, *args, **kwargs):
+        object_name = request.GET.get("objectName")
+        if not object_name:
+            return Response({"success": 0, "message": "❌ objectName is required.", "data": {}}, status=400)
+
+        # ✅ fetch DataObject
+        data_object = get_object_or_404(DataObject, objectName=object_name)
+
+        # ✅ fetch specs linked to that object
+        specs_qs = Specs.objects.filter(objectName=data_object).order_by("tab", "position")
+
+        fields = [
+            "company",
+            "objectName",
+            "tab",
+            "field_id",
+            "mandatory",
+            "allowed_values",
+            "sap_table",
+            "sap_field_id",
+            "sap_description",
+        ]
+
+        data = []
+        if specs_qs.exists():
+            for spec in specs_qs:
+                data.append({
+                    "company": spec.company,
+                    "objectName": spec.objectName.objectName,
+                    "tab": spec.tab,
+                    "field_id": spec.field_id,
+                    # 🔹 if mandatory = "No", keep it blank in Excel
+                    "mandatory": "" if str(spec.mandatory).strip().lower() in ["no", "n"] else "Yes",
+                    "allowed_values": ",".join(spec.allowed_values) if spec.allowed_values else "",
+                    "sap_table": spec.sap_table or "",
+                    "sap_field_id": spec.sap_field_id or "",
+                    "sap_description": spec.sap_description or "",
+                })
+        else:
+            data.append({
+                "company": data_object.company,
+                "objectName": data_object.objectName,
+                "tab": "",
+                "field_id": "",
+                "mandatory": "",
+                "allowed_values": "",
+                "sap_table": "",
+                "sap_field_id": "",
+                "sap_description": "",
+            })
+
+        df = pd.DataFrame(data, columns=fields)
+
+        response = HttpResponse(
+            content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+        filename = f"{object_name}_specs.xlsx"
+        response["Content-Disposition"] = f'attachment; filename="{filename}"'
+
+        with pd.ExcelWriter(response, engine="openpyxl") as writer:
+            df.to_excel(writer, index=False, sheet_name="Specs")
+
+        return response
+
+    def post(self, request, *args, **kwargs):
+        print("📥 Entered POST method for specs upload")
+        file = request.FILES.get("file")
+        if not file:
+            print("❌ No file uploaded")
+            return Response(
+                {"success": 0, "message": "No file uploaded.", "data": {}},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            print("📑 Reading Excel file...")
+            df = pd.read_excel(file)
+            print(f"✅ Excel loaded with {len(df)} rows and {len(df.columns)} columns")
+
+            required_columns = [
+                "objectName", "tab", "field_id", "mandatory",
+                "allowed_values", "sap_table", "sap_field_id", "sap_description"
+            ]
+            for col in required_columns:
+                if col not in df.columns:
+                    print(f"❌ Missing column: {col}")
+                    return Response(
+                        {"success": 0, "message": f"Missing column: {col}", "data": {}},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+
+            print("🔍 Pre-validating mandatory fields...")
+            mandatory_fields = ["objectName", "tab", "field_id"]
+
+            for idx, row in df.iterrows():
+                for field in mandatory_fields:
+                    if pd.isna(row.get(field)) or str(row.get(field)).strip() == "":
+                        print(f"❌ Row {idx+2}: Missing field {field}")
+                        return Response(
+                            {
+                                "success": 0,
+                                "message": f"Row {idx + 2}: Missing required field '{field}'",
+                                "data": {},
+                            },
+                            status=status.HTTP_400_BAD_REQUEST,
+                        )
+
+            print("🧹 Cleaning up rows...")
+            df["objectName"] = df["objectName"].astype(str).str.strip()
+            df["tab"] = df["tab"].astype(str).str.strip().str.lower()
+            df["field_id"] = df["field_id"].astype(str).str.strip().str.upper()
+
+            df["mandatory"] = df["mandatory"].apply(
+                lambda val: "Yes" if str(val).strip().lower() in ["yes", "y"] else "No"
+            )
+
+            object_name = df["objectName"].iloc[0]
+            if not all(df["objectName"] == object_name):
+                print("❌ Inconsistent objectName values detected")
+                return Response(
+                    {
+                        "success": 0,
+                        "message": "All rows must have the same objectName.",
+                        "data": {},
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            print(f"🔎 Fetching DataObject for objectName={object_name}")
+            data_object = get_object_or_404(models.DataObject, objectName__iexact=object_name)
+
+            try:
+                print("🔐 Checking object-level permissions...")
+                self.check_object_permissions(request, data_object)
+            except PermissionDenied as e:
+                print(f"❌ Permission denied: {str(e)}")
+                return Response(
+                    {
+                        "success": 0,
+                        "message": str(e) or "You do not have permission to perform this action.",
+                    },
+                    status=status.HTTP_403_FORBIDDEN,
+                )
+
+            print("📂 Fetching existing specs...")
+            existing_specs = Specs.objects.filter(objectName=data_object)
+            existing_map = {(s.tab.lower(), s.field_id.upper()): s for s in existing_specs}
+            print(f"✅ Found {len(existing_specs)} existing specs")
+
+            uploaded_combinations = set()
+            inserted, updated, deleted = 0, 0, 0
+
+            print("⚡ Starting transaction for upsert + delete...")
+            with transaction.atomic():
+                for _, row in df.iterrows():
+                    combo = (row["tab"], row["field_id"])
+                    uploaded_combinations.add(combo)
+
+                    allowed_vals_cell = row.get("allowed_values")
+                    allowed_values = (
+                        [v.strip() for v in str(allowed_vals_cell).split(",") if v.strip()]
+                        if pd.notna(allowed_vals_cell) and str(allowed_vals_cell).strip() != ""
+                        else None
+                    )
+
+                    if combo in existing_map:
+                        print(f"✏️ Updating spec: {combo}")
+                        spec = existing_map[combo]
+                        spec.mandatory = row["mandatory"]
+                        spec.allowed_values = allowed_values
+                        spec.sap_table = (
+                            row["sap_table"]
+                            if pd.notna(row.get("sap_table")) and str(row.get("sap_table")).strip()
+                            else None
+                        )
+                        spec.sap_field_id = (
+                            row["sap_field_id"]
+                            if pd.notna(row.get("sap_field_id")) and str(row.get("sap_field_id")).strip()
+                            else None
+                        )
+                        spec.sap_description = (
+                            row["sap_description"]
+                            if pd.notna(row.get("sap_description")) and str(row.get("sap_description")).strip()
+                            else None
+                        )
+                        spec.save()
+                        updated += 1
+                    else:
+                        print(f"➕ Inserting new spec: {combo}")
+                        Specs.objects.create(
+                            company=row.get("company", 'GenOne'),  # keep original company if column exists
+                            objectName=data_object,
+                            tab=row["tab"],
+                            field_id=row["field_id"],
+                            mandatory=row["mandatory"],
+                            allowed_values=allowed_values,
+                            sap_table=row["sap_table"]
+                            if pd.notna(row.get("sap_table")) and str(row.get("sap_table")).strip()
+                            else None,
+                            sap_field_id=row["sap_field_id"]
+                            if pd.notna(row.get("sap_field_id")) and str(row.get("sap_field_id")).strip()
+                            else None,
+                            sap_description=row["sap_description"]
+                            if pd.notna(row.get("sap_description")) and str(row.get("sap_description")).strip()
+                            else None,
+                        )
+                        inserted += 1
+
+                print("🗑️ Checking for deleted specs...")
+                for combo, spec in existing_map.items():
+                    if combo not in uploaded_combinations:
+                        print(f"🗑️ Deleting spec: {combo}")
+                        spec.ruleapplied_set.all().delete()
+                        spec.delete()
+                        deleted += 1
+
+            print(f"✅ Upload completed: inserted={inserted}, updated={updated}, deleted={deleted}")
+            return Response(
+                {
+                    "success": 1,
+                    "message": "Specs uploaded successfully.",
+                    "data": {"inserted": inserted, "updated": updated, "deleted": deleted},
+                },
+                status=status.HTTP_200_OK,
+            )
+
+        except Exception as e:
+            print(f"❌ Exception occurred: {str(e)}")
+            return Response(
+                {"success": 0, "message": str(e), "data": {}},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+
+import pandas as pd
+import sqlalchemy
+import os
+from rest_framework.views import APIView
+from rest_framework.response import Response
+from rest_framework import status
+
+
+class DataLoad(APIView):
+    """
+    API to load and transform Excel migration data for a given objectName,
+    then insert into MySQL tables.
+    """
+
+    def get(self, request, *args, **kwargs):
+        print("➡️ Entered DataLoad GET method")
+
+        object_name_id = request.GET.get("objectName")
+        if not object_name_id:
+            return Response(
+                {"success": 0, "message": "❌ objectName is required.", "data": {}},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            # ----------------------------
+            # STEP 0: Get Object Name
+            # ----------------------------
+            object_name_qry = models.DataObject.objects.filter(id=object_name_id).first()
+            object_name = object_name_qry.objectName if object_name_qry else None
+            print(f"🔍 Object Name Resolved: {object_name}")
+
+            # ✅ Check release status before proceeding
+            file_record = models.DataFile.objects.filter(data_object_id=object_name_id).last()
+            if not file_record or not file_record.release:
+                print(f"⛔ Data load blocked: Object {object_name} not released")
+                return Response(
+                    {
+                        "success": 0,
+                        "message": f"⛔ Data load blocked: {object_name} is not released yet",
+                        "data": {},
+                    },
+                    status=status.HTTP_403_FORBIDDEN,
+                )
+
+            working_info = create_and_get_working_file_path(object_name_id)
+            if not working_info or not os.path.exists(working_info["working_file_path"]):
+                print(f"❌ Working file not found for object: {object_name}")
+                return Response(
+                    {"success": 0, "message": f"❌ Working file not found for {object_name}", "data": {}},
+                    status=status.HTTP_404_NOT_FOUND,
+                )
+
+            file_path = working_info["working_file_path"]
+            print(f"📂 Using working file: {file_path}")
+
+            # ----------------------------
+            # STEP 1: Load Excel + Build Mapping
+            # ----------------------------
+            print("📑 Reading Excel...")
+            with pd.ExcelFile(file_path) as xls:
+                mapping_df = pd.read_excel(xls, sheet_name="mapping")
+                print("✅ Mapping sheet loaded")
+                print(mapping_df.head())
+
+                tab_table_map = {}
+                print("🔄 Building mapping dictionary...")
+                for _, row in mapping_df.iterrows():
+                    tab = row["tab"]
+                    src_field = row["field_id"]
+                    target_table = row["sap_table"]
+                    target_field = row["sap_field_id"]
+
+                    if pd.isna(target_table) or pd.isna(target_field):
+                        print(f"⚠️ Skipping unmapped row: {row.to_dict()}")
+                        continue
+
+                    if tab not in tab_table_map:
+                        tab_table_map[tab] = {}
+
+                    if target_table not in tab_table_map[tab]:
+                        tab_table_map[tab][target_table] = {}
+
+                    tab_table_map[tab][target_table][src_field] = target_field
+
+                print("✅ Mapping dictionary created")
+                print(tab_table_map)
+
+                # ----------------------------
+                # STEP 2: Process Tabs
+                # ----------------------------
+                staging_data = {}
+                print("🔄 Processing sheet tabs...")
+                for tab_name in xls.sheet_names:
+                    if tab_name == "mapping":
+                        continue
+
+                    print(f"📑 Processing Tab: {tab_name}")
+                    df = pd.read_excel(xls, sheet_name=tab_name)
+                    print(f"   ➡️ Loaded {len(df)} rows from {tab_name}")
+
+                    if tab_name not in tab_table_map:
+                        print(f"⚠️ No mapping found for tab {tab_name}, skipping...")
+                        continue
+
+                    for target_table, field_map in tab_table_map[tab_name].items():
+                        mapped_df = pd.DataFrame()
+                        print(f"   🔄 Mapping for Target Table: {target_table}")
+
+                        for src_field, target_field in field_map.items():
+                            if src_field in df.columns:
+                                mapped_df[target_field] = df[src_field]
+                                print(f"      ✅ Mapped {src_field} → {target_field}")
+                            else:
+                                pass
+                                print(f"      ⚠️ Source field {src_field} not found in tab {tab_name}")
+
+                        if target_table not in staging_data:
+                            staging_data[target_table] = mapped_df
+                        else:
+                            staging_data[target_table] = pd.concat(
+                                [staging_data[target_table], mapped_df],
+                                ignore_index=True,
+                            )
+
+                print("✅ All tabs processed")
+                print("📊 Staging Data Summary:")
+                for k, v in staging_data.items():
+                    pass
+                    print(f"   - {k}: {len(v)} rows")
+
+            # ----------------------------
+            # STEP 3: Insert Into Database
+            # ----------------------------
+            print("🔌 Connecting to SAP HANA...")
+            engine = sqlalchemy.create_engine(
+                    f"mysql+pymysql://{SAP_DB_USER}:{SAP_DB_PASS}@{SAP_DB_HOST}:{SAP_DB_PORT}/{SAP_DB_NAME}"
+                )
+            print("✅ DB Connection established")
+
+            result_summary = {}
+            for table, df in staging_data.items():
+                try:
+                    if df.empty:
+                        print(f"⚠️ Skipping {table} (0 rows)")
+                        continue
+
+                    print(f"📥 Inserting {len(df)} rows into {table}...")
+                    df.to_sql(table, con=engine, if_exists="append", index=False)
+                    print(f"✅ Inserted {len(df)} rows into {table}")
+                    result_summary[table] = len(df)
+
+                except Exception as e:
+                    err_str = str(e)
+                    print(f"❌ Error while inserting into {table}: {err_str}")
+
+                    if "Duplicate entry" in err_str:
+                        msg = f"❌ Duplicate entry error while inserting into {table} (Primary Key violation)"
+                    elif "Unknown column" in err_str:
+                        msg = f"❌ Column mismatch while inserting into {table} (check mapping vs DB schema)"
+                    elif "doesn't exist" in err_str or "not found" in err_str.lower():
+                        msg = f"❌ Target table {table} does not exist in database"
+                    else:
+                        msg = f"❌ Unexpected error while inserting into {table}: {err_str}"
+
+                    return Response({"success": 0, "message": msg, "data": {}}, status=500)
+
+            print("✅ Data Load Completed Successfully")
+            print("📊 Final Insert Summary:", result_summary)
+
+            # ----------------------------
+            # STEP 4: Update data_load flag
+            # ----------------------------
+            try:
+                file_record = models.DataFile.objects.filter(data_object_id=object_name_id).last()
+                if file_record:
+                    file_record.data_load = 1
+                    file_record.save(update_fields=["data_load"])
+                    print(f"✅ Updated data_load=1 for file: {file_record.file_name}")
+                else:
+                    print("⚠️ No DataFile found to update data_load")
+            except Exception as e:
+                print(f"⚠️ Failed to update data_load flag: {str(e)}")
+
+            return Response(
+                {
+                    "success": 1,
+                    "message": f"✅ Data load completed for {object_name}",
+                    "data": {"staging_summary": result_summary},
+                },
+                status=200,
+            )
+
+
+        except Exception as e:
+            print(f"💥 Critical Error: {str(e)}")
+            return Response(
+                {"success": 0, "message": f"❌ Error: {str(e)}", "data": {}},
+                status=500,
+            )
+
+
+

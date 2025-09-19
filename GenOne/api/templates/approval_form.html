@@ -40,31 +40,42 @@
           class="w-full border border-gray-300 rounded-md p-2 focus:ring-2 focus:ring-blue-500 focus:outline-none resize-none"></textarea>
       </div>
 
-      <!-- Action Buttons -->
       <div class="flex gap-3 justify-between pt-2">
-        {% if file.approval_status == 0 %}
-        <!-- Initial approval request -->
-        <button type="submit" name="action" value="approve"
-          class="flex-1 bg-green-600 hover:bg-green-700 text-white py-2 rounded-md font-semibold transition">
-          ✅ Approve
-        </button>
-        <button type="submit" name="action" value="reject"
-          class="flex-1 bg-red-600 hover:bg-red-700 text-white py-2 rounded-md font-semibold transition">
-          ❌ Reject
-        </button>
+  {% if file.approval_status == 0 %}
+    <!-- Initial approval request -->
+    <button type="submit" name="action" value="approve"
+      class="flex-1 bg-green-600 hover:bg-green-700 text-white py-2 rounded-md font-semibold transition">
+      ✅ Approve
+    </button>
+    <button type="submit" name="action" value="reject"
+      class="flex-1 bg-red-600 hover:bg-red-700 text-white py-2 rounded-md font-semibold transition">
+      ❌ Reject
+    </button>
 
-        {% elif file.approval_status == 1 %}
-        <!-- Cancel approval request -->
-        <button type="submit" name="action" value="approve"
-          class="flex-1 bg-yellow-500 hover:bg-yellow-600 text-white py-2 rounded-md font-semibold transition">
-          ↩️ Revert Approval
-        </button>
-        <button type="submit" name="action" value="reject"
-          class="flex-1 bg-gray-600 hover:bg-gray-700 text-white py-2 rounded-md font-semibold transition">
-          🚫 Reject Cancel
-        </button>
-        {% endif %}
-      </div>
+  {% elif file.approval_status == 1 %}
+    <!-- Cancel approval request -->
+    <button type="submit" name="action" value="approve"
+      class="flex-1 bg-yellow-500 hover:bg-yellow-600 text-white py-2 rounded-md font-semibold transition">
+      ↩️ Revert Approval
+    </button>
+    <button type="submit" name="action" value="reject"
+      class="flex-1 bg-gray-600 hover:bg-gray-700 text-white py-2 rounded-md font-semibold transition">
+      🚫 Reject Cancel
+    </button>
+
+  {% elif file.approval_status == 2 %}
+    <!-- Rejected file: allow re-approval or keep rejected -->
+    <button type="submit" name="action" value="approve"
+      class="flex-1 bg-green-600 hover:bg-green-700 text-white py-2 rounded-md font-semibold transition">
+      ✅ Re-Approve
+    </button>
+    <button type="submit" name="action" value="reject"
+      class="flex-1 bg-red-600 hover:bg-red-700 text-white py-2 rounded-md font-semibold transition">
+      ❌ Keep Rejected
+    </button>
+  {% endif %}
+</div>
+
     </form>
   </div>
 

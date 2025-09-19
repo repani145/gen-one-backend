@@ -68,6 +68,10 @@ urlpatterns = [
 
     #  path("datafiles/<int:data_file_id>/comments/", views.ApprovalCommentListView.as_view(), name="approval-comments"),
     path("dataobjects/<int:data_object_id>/comments/", views.DataObjectCommentsView.as_view(), name="dataobject-comments"),
+
+    path("specs/download-upload/", views.SpecsDownloadUploadView.as_view(), name="download-specs"),
+
+    path("dataload/", views.DataLoad.as_view(), name="data-load"),
 ]
 
 
